@@ -1,55 +1,34 @@
-// Copyright 2016 The Gogs Authors. All rights reserved.
+// Copyright 2019 The Gitea Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
 package models
 
 import (
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"code.gitea.io/gitea/modules/setting"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func Test_parsePostgreSQLHostPort(t *testing.T) {
-	tests := []struct {
-		HostPort string
-		Host     string
-		Port     string
-	}{
-		{
-			HostPort: "127.0.0.1:1234",
-			Host:     "127.0.0.1",
-			Port:     "1234",
-		},
-		{
-			HostPort: "127.0.0.1",
-			Host:     "127.0.0.1",
-			Port:     "5432",
-		},
-		{
-			HostPort: "[::1]:1234",
-			Host:     "[::1]",
-			Port:     "1234",
-		},
-		{
-			HostPort: "[::1]",
-			Host:     "[::1]",
-			Port:     "5432",
-		},
-		{
-			HostPort: "/tmp/pg.sock:1234",
-			Host:     "/tmp/pg.sock",
-			Port:     "1234",
-		},
-		{
-			HostPort: "/tmp/pg.sock",
-			Host:     "/tmp/pg.sock",
-			Port:     "5432",
-		},
+func TestDumpDatabase(t *testing.T) {
+	assert.NoError(t, PrepareTestDatabase())
+
+	dir, err := ioutil.TempDir(os.TempDir(), "dump")
+	assert.NoError(t, err)
+
+	type Version struct {
+		ID      int64 `xorm:"pk autoincr"`
+		Version int64
 	}
-	for _, test := range tests {
-		host, port := parsePostgreSQLHostPort(test.HostPort)
-		assert.Equal(t, test.Host, host)
-		assert.Equal(t, test.Port, port)
+	assert.NoError(t, x.Sync2(new(Version)))
+
+	for _, dbName := range setting.SupportedDatabases {
+		dbType := setting.GetDBTypeByName(dbName)
+		assert.NoError(t, DumpDatabase(filepath.Join(dir, dbType+".sql"), dbType))
 	}
 }

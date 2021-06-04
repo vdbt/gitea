@@ -1,17 +1,18 @@
 package openidConnect
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/ioutil"
 	"net/http"
 	"strings"
-	"fmt"
-	"encoding/json"
-	"encoding/base64"
-	"io/ioutil"
-	"errors"
-	"golang.org/x/oauth2"
-	"github.com/markbates/goth"
 	"time"
-	"bytes"
+
+	"github.com/markbates/goth"
+	"golang.org/x/oauth2"
 )
 
 const (
@@ -53,8 +54,8 @@ type Provider struct {
 	Secret       string
 	CallbackURL  string
 	HTTPClient   *http.Client
+	OpenIDConfig *OpenIDConfig
 	config       *oauth2.Config
-	openIDConfig *OpenIDConfig
 	providerName string
 
 	UserIdClaims    []string
@@ -73,7 +74,12 @@ type OpenIDConfig struct {
 	AuthEndpoint     string `json:"authorization_endpoint"`
 	TokenEndpoint    string `json:"token_endpoint"`
 	UserInfoEndpoint string `json:"userinfo_endpoint"`
-	Issuer           string `json:"issuer"`
+
+	// If OpenID discovery is enabled, the end_session_endpoint field can optionally be provided
+	// in the discovery endpoint response according to OpenID spec. See:
+	// https://openid.net/specs/openid-connect-session-1_0-17.html#OPMetadata
+	EndSessionEndpoint string `json:"end_session_endpoint, omitempty"`
+	Issuer             string `json:"issuer"`
 }
 
 // New creates a new OpenID Connect provider, and sets up important connection details.
@@ -89,14 +95,14 @@ func New(clientKey, secret, callbackURL, openIDAutoDiscoveryURL string, scopes .
 		Secret:      secret,
 		CallbackURL: callbackURL,
 
-		UserIdClaims:   []string{subjectClaim},
-		NameClaims:     []string{NameClaim},
-		NickNameClaims: []string{NicknameClaim, PreferredUsernameClaim},
-		EmailClaims:    []string{EmailClaim},
-		AvatarURLClaims:[]string{PictureClaim},
-		FirstNameClaims:[]string{GivenNameClaim},
-		LastNameClaims: []string{FamilyNameClaim},
-		LocationClaims: []string{AddressClaim},
+		UserIdClaims:    []string{subjectClaim},
+		NameClaims:      []string{NameClaim},
+		NickNameClaims:  []string{NicknameClaim, PreferredUsernameClaim},
+		EmailClaims:     []string{EmailClaim},
+		AvatarURLClaims: []string{PictureClaim},
+		FirstNameClaims: []string{GivenNameClaim},
+		LastNameClaims:  []string{FamilyNameClaim},
+		LocationClaims:  []string{AddressClaim},
 
 		providerName: "openid-connect",
 	}
@@ -105,7 +111,7 @@ func New(clientKey, secret, callbackURL, openIDAutoDiscoveryURL string, scopes .
 	if err != nil {
 		return nil, err
 	}
-	p.openIDConfig = openIDConfig
+	p.OpenIDConfig = openIDConfig
 
 	p.config = newConfig(p, scopes, openIDConfig)
 	return p, nil
@@ -173,6 +179,7 @@ func (p *Provider) FetchUser(session goth.Session) (goth.User, error) {
 		RefreshToken: sess.RefreshToken,
 		ExpiresAt:    expiresAt,
 		RawData:      claims,
+		IDToken:      sess.IDToken,
 	}
 
 	p.userFromClaims(claims, &user)
@@ -200,11 +207,21 @@ func (p *Provider) RefreshToken(refreshToken string) (*oauth2.Token, error) {
 func (p *Provider) validateClaims(claims map[string]interface{}) (time.Time, error) {
 	audience := getClaimValue(claims, []string{audienceClaim})
 	if audience != p.ClientKey {
-		return time.Time{}, errors.New("audience in token does not match client key")
+		found := false
+		audiences := getClaimValues(claims, []string{audienceClaim})
+		for _, aud := range audiences {
+			if aud == p.ClientKey {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return time.Time{}, errors.New("audience in token does not match client key")
+		}
 	}
 
 	issuer := getClaimValue(claims, []string{issuerClaim})
-	if issuer != p.openIDConfig.Issuer {
+	if issuer != p.OpenIDConfig.Issuer {
 		return time.Time{}, errors.New("issuer in token does not match issuer in OpenIDConfig discovery")
 	}
 
@@ -233,11 +250,11 @@ func (p *Provider) userFromClaims(claims map[string]interface{}, user *goth.User
 
 func (p *Provider) getUserInfo(accessToken string, claims map[string]interface{}) error {
 	// skip if there is no UserInfoEndpoint or is explicitly disabled
-	if p.openIDConfig.UserInfoEndpoint == "" || p.SkipUserInfoRequest {
+	if p.OpenIDConfig.UserInfoEndpoint == "" || p.SkipUserInfoRequest {
 		return nil
 	}
 
-	userInfoClaims, err := p.fetchUserInfo(p.openIDConfig.UserInfoEndpoint, accessToken)
+	userInfoClaims, err := p.fetchUserInfo(p.OpenIDConfig.UserInfoEndpoint, accessToken)
 	if err != nil {
 		return err
 	}
@@ -355,6 +372,24 @@ func getClaimValue(data map[string]interface{}, claims []string) string {
 	return ""
 }
 
+func getClaimValues(data map[string]interface{}, claims []string) []string {
+	var result []string
+
+	for _, claim := range claims {
+		if value, ok := data[claim]; ok {
+			if stringValues, ok := value.([]interface{}); ok {
+				for _, stringValue := range stringValues {
+					if s, ok := stringValue.(string); ok && len(s) > 0 {
+						result = append(result, s)
+					}
+				}
+			}
+		}
+	}
+
+	return result
+}
+
 // decodeJWT decodes a JSON Web Token into a simple map
 // http://openid.net/specs/draft-jones-json-web-token-07.html
 func decodeJWT(jwt string) (map[string]interface{}, error) {
@@ -363,13 +398,8 @@ func decodeJWT(jwt string) (map[string]interface{}, error) {
 		return nil, errors.New("jws: invalid token received, not all parts available")
 	}
 
-	// Re-pad, if needed
-	encodedPayload := jwtParts[1]
-	if l := len(encodedPayload) % 4; l != 0 {
-		encodedPayload += strings.Repeat("=", 4-l)
-	}
+	decodedPayload, err := base64.URLEncoding.WithPadding(base64.NoPadding).DecodeString(jwtParts[1])
 
-	decodedPayload, err := base64.StdEncoding.DecodeString(encodedPayload)
 	if err != nil {
 		return nil, err
 	}

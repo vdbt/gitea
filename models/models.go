@@ -1,31 +1,30 @@
 // Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2018 The Gitea Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
 package models
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
-	"os"
-	"path"
-	"path/filepath"
+	"reflect"
 	"strings"
 
-	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
 
 	// Needed for the MySQL driver
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/go-xorm/core"
-	"github.com/go-xorm/xorm"
+	"xorm.io/xorm"
+	"xorm.io/xorm/names"
+	"xorm.io/xorm/schemas"
 
 	// Needed for the Postgresql driver
 	_ "github.com/lib/pq"
 
-	// Needed for the MSSSQL driver
+	// Needed for the MSSQL driver
 	_ "github.com/denisenkom/go-mssqldb"
 )
 
@@ -35,7 +34,7 @@ type Engine interface {
 	Count(...interface{}) (int64, error)
 	Decr(column string, arg ...interface{}) *xorm.Session
 	Delete(interface{}) (int64, error)
-	Exec(string, ...interface{}) (sql.Result, error)
+	Exec(...interface{}) (sql.Result, error)
 	Find(interface{}, ...interface{}) error
 	Get(interface{}) (bool, error)
 	ID(interface{}) *xorm.Session
@@ -47,7 +46,17 @@ type Engine interface {
 	Join(joinOperator string, tablename interface{}, condition string, args ...interface{}) *xorm.Session
 	SQL(interface{}, ...interface{}) *xorm.Session
 	Where(interface{}, ...interface{}) *xorm.Session
+	Asc(colNames ...string) *xorm.Session
+	Desc(colNames ...string) *xorm.Session
+	Limit(limit int, start ...int) *xorm.Session
+	SumInt(bean interface{}, columnName string) (res int64, err error)
 }
+
+const (
+	// When queries are broken down in parts because of the number
+	// of parameters, attempt to break by this amount
+	maxQueryParameters = 300
+)
 
 var (
 	x      *xorm.Engine
@@ -55,18 +64,6 @@ var (
 
 	// HasEngine specifies if we have a xorm.Engine
 	HasEngine bool
-
-	// DbCfg holds the database settings
-	DbCfg struct {
-		Type, Host, Name, User, Passwd, Path, SSLMode string
-		Timeout                                       int
-	}
-
-	// EnableSQLite3 use SQLite3
-	EnableSQLite3 bool
-
-	// EnableTiDB enable TiDB
-	EnableTiDB bool
 )
 
 func init() {
@@ -106,6 +103,7 @@ func init() {
 		new(LFSMetaObject),
 		new(TwoFactor),
 		new(GPGKey),
+		new(GPGKeyImport),
 		new(RepoUnit),
 		new(RepoRedirect),
 		new(ExternalLoginUser),
@@ -117,166 +115,104 @@ func init() {
 		new(TrackedTime),
 		new(DeletedBranch),
 		new(RepoIndexerStatus),
+		new(IssueDependency),
+		new(LFSLock),
+		new(Reaction),
+		new(IssueAssignees),
+		new(U2FRegistration),
+		new(TeamUnit),
+		new(Review),
+		new(OAuth2Application),
+		new(OAuth2AuthorizationCode),
+		new(OAuth2Grant),
+		new(Task),
+		new(LanguageStat),
+		new(EmailHash),
+		new(UserRedirect),
+		new(Project),
+		new(ProjectBoard),
+		new(ProjectIssue),
+		new(Session),
+		new(RepoTransfer),
 	)
 
 	gonicNames := []string{"SSL", "UID"}
 	for _, name := range gonicNames {
-		core.LintGonicMapper[name] = true
+		names.LintGonicMapper[name] = true
 	}
 }
 
-// LoadConfigs loads the database settings
-func LoadConfigs() {
-	sec := setting.Cfg.Section("database")
-	DbCfg.Type = sec.Key("DB_TYPE").String()
-	switch DbCfg.Type {
-	case "sqlite3":
-		setting.UseSQLite3 = true
-	case "mysql":
-		setting.UseMySQL = true
-	case "postgres":
-		setting.UsePostgreSQL = true
-	case "tidb":
-		setting.UseTiDB = true
-	case "mssql":
-		setting.UseMSSQL = true
-	}
-	DbCfg.Host = sec.Key("HOST").String()
-	DbCfg.Name = sec.Key("NAME").String()
-	DbCfg.User = sec.Key("USER").String()
-	if len(DbCfg.Passwd) == 0 {
-		DbCfg.Passwd = sec.Key("PASSWD").String()
-	}
-	DbCfg.SSLMode = sec.Key("SSL_MODE").String()
-	DbCfg.Path = sec.Key("PATH").MustString("data/gitea.db")
-	DbCfg.Timeout = sec.Key("SQLITE_TIMEOUT").MustInt(500)
-
-	sec = setting.Cfg.Section("indexer")
-	setting.Indexer.IssuePath = sec.Key("ISSUE_INDEXER_PATH").MustString(path.Join(setting.AppDataPath, "indexers/issues.bleve"))
-	if !filepath.IsAbs(setting.Indexer.IssuePath) {
-		setting.Indexer.IssuePath = path.Join(setting.AppWorkPath, setting.Indexer.IssuePath)
-	}
-	setting.Indexer.RepoIndexerEnabled = sec.Key("REPO_INDEXER_ENABLED").MustBool(false)
-	setting.Indexer.RepoPath = sec.Key("REPO_INDEXER_PATH").MustString(path.Join(setting.AppDataPath, "indexers/repos.bleve"))
-	if !filepath.IsAbs(setting.Indexer.RepoPath) {
-		setting.Indexer.RepoPath = path.Join(setting.AppWorkPath, setting.Indexer.RepoPath)
-	}
-	setting.Indexer.UpdateQueueLength = sec.Key("UPDATE_BUFFER_LEN").MustInt(20)
-	setting.Indexer.MaxIndexerFileSize = sec.Key("MAX_FILE_SIZE").MustInt64(512 * 1024 * 1024)
-}
-
-// parsePostgreSQLHostPort parses given input in various forms defined in
-// https://www.postgresql.org/docs/current/static/libpq-connect.html#LIBPQ-CONNSTRING
-// and returns proper host and port number.
-func parsePostgreSQLHostPort(info string) (string, string) {
-	host, port := "127.0.0.1", "5432"
-	if strings.Contains(info, ":") && !strings.HasSuffix(info, "]") {
-		idx := strings.LastIndex(info, ":")
-		host = info[:idx]
-		port = info[idx+1:]
-	} else if len(info) > 0 {
-		host = info
-	}
-	return host, port
-}
-
-func parseMSSQLHostPort(info string) (string, string) {
-	host, port := "127.0.0.1", "1433"
-	if strings.Contains(info, ":") {
-		host = strings.Split(info, ":")[0]
-		port = strings.Split(info, ":")[1]
-	} else if strings.Contains(info, ",") {
-		host = strings.Split(info, ",")[0]
-		port = strings.TrimSpace(strings.Split(info, ",")[1])
-	} else if len(info) > 0 {
-		host = info
-	}
-	return host, port
-}
-
-func getEngine() (*xorm.Engine, error) {
-	connStr := ""
-	var Param = "?"
-	if strings.Contains(DbCfg.Name, Param) {
-		Param = "&"
-	}
-	switch DbCfg.Type {
-	case "mysql":
-		if DbCfg.Host[0] == '/' { // looks like a unix socket
-			connStr = fmt.Sprintf("%s:%s@unix(%s)/%s%scharset=utf8&parseTime=true",
-				DbCfg.User, DbCfg.Passwd, DbCfg.Host, DbCfg.Name, Param)
-		} else {
-			connStr = fmt.Sprintf("%s:%s@tcp(%s)/%s%scharset=utf8&parseTime=true",
-				DbCfg.User, DbCfg.Passwd, DbCfg.Host, DbCfg.Name, Param)
-		}
-	case "postgres":
-		host, port := parsePostgreSQLHostPort(DbCfg.Host)
-		if host[0] == '/' { // looks like a unix socket
-			connStr = fmt.Sprintf("postgres://%s:%s@:%s/%s%ssslmode=%s&host=%s",
-				url.QueryEscape(DbCfg.User), url.QueryEscape(DbCfg.Passwd), port, DbCfg.Name, Param, DbCfg.SSLMode, host)
-		} else {
-			connStr = fmt.Sprintf("postgres://%s:%s@%s:%s/%s%ssslmode=%s",
-				url.QueryEscape(DbCfg.User), url.QueryEscape(DbCfg.Passwd), host, port, DbCfg.Name, Param, DbCfg.SSLMode)
-		}
-	case "mssql":
-		host, port := parseMSSQLHostPort(DbCfg.Host)
-		connStr = fmt.Sprintf("server=%s; port=%s; database=%s; user id=%s; password=%s;", host, port, DbCfg.Name, DbCfg.User, DbCfg.Passwd)
-	case "sqlite3":
-		if !EnableSQLite3 {
-			return nil, errors.New("this binary version does not build support for SQLite3")
-		}
-		if err := os.MkdirAll(path.Dir(DbCfg.Path), os.ModePerm); err != nil {
-			return nil, fmt.Errorf("Failed to create directories: %v", err)
-		}
-		connStr = fmt.Sprintf("file:%s?cache=shared&mode=rwc&_busy_timeout=%d", DbCfg.Path, DbCfg.Timeout)
-	case "tidb":
-		if !EnableTiDB {
-			return nil, errors.New("this binary version does not build support for TiDB")
-		}
-		if err := os.MkdirAll(path.Dir(DbCfg.Path), os.ModePerm); err != nil {
-			return nil, fmt.Errorf("Failed to create directories: %v", err)
-		}
-		connStr = "goleveldb://" + DbCfg.Path
-	default:
-		return nil, fmt.Errorf("Unknown database type: %s", DbCfg.Type)
+// GetNewEngine returns a new xorm engine from the configuration
+func GetNewEngine() (*xorm.Engine, error) {
+	connStr, err := setting.DBConnStr()
+	if err != nil {
+		return nil, err
 	}
 
-	return xorm.NewEngine(DbCfg.Type, connStr)
+	var engine *xorm.Engine
+
+	if setting.Database.UsePostgreSQL && len(setting.Database.Schema) > 0 {
+		// OK whilst we sort out our schema issues - create a schema aware postgres
+		registerPostgresSchemaDriver()
+		engine, err = xorm.NewEngine("postgresschema", connStr)
+	} else {
+		engine, err = xorm.NewEngine(setting.Database.Type, connStr)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	if setting.Database.Type == "mysql" {
+		engine.Dialect().SetParams(map[string]string{"rowFormat": "DYNAMIC"})
+	} else if setting.Database.Type == "mssql" {
+		engine.Dialect().SetParams(map[string]string{"DEFAULT_VARCHAR": "nvarchar"})
+	}
+	engine.SetSchema(setting.Database.Schema)
+	return engine, nil
 }
 
 // NewTestEngine sets a new test xorm.Engine
-func NewTestEngine(x *xorm.Engine) (err error) {
-	x, err = getEngine()
+func NewTestEngine() (err error) {
+	x, err = GetNewEngine()
 	if err != nil {
 		return fmt.Errorf("Connect to database: %v", err)
 	}
 
-	x.SetMapper(core.GonicMapper{})
-	x.SetLogger(log.XORMLogger)
-	x.ShowSQL(!setting.ProdMode)
+	x.SetMapper(names.GonicMapper{})
+	x.SetLogger(NewXORMLogger(!setting.IsProd()))
+	x.ShowSQL(!setting.IsProd())
 	return x.StoreEngine("InnoDB").Sync2(tables...)
 }
 
 // SetEngine sets the xorm.Engine
 func SetEngine() (err error) {
-	x, err = getEngine()
+	x, err = GetNewEngine()
 	if err != nil {
 		return fmt.Errorf("Failed to connect to database: %v", err)
 	}
 
-	x.SetMapper(core.GonicMapper{})
+	x.SetMapper(names.GonicMapper{})
 	// WARNING: for serv command, MUST remove the output to os.stdout,
 	// so use log file to instead print to stdout.
-	x.SetLogger(log.XORMLogger)
-	x.ShowSQL(true)
+	x.SetLogger(NewXORMLogger(setting.Database.LogSQL))
+	x.ShowSQL(setting.Database.LogSQL)
+	x.SetMaxOpenConns(setting.Database.MaxOpenConns)
+	x.SetMaxIdleConns(setting.Database.MaxIdleConns)
+	x.SetConnMaxLifetime(setting.Database.ConnMaxLifetime)
 	return nil
 }
 
 // NewEngine initializes a new xorm.Engine
-func NewEngine(migrateFunc func(*xorm.Engine) error) (err error) {
+// This function must never call .Sync2() if the provided migration function fails.
+// When called from the "doctor" command, the migration function is a version check
+// that prevents the doctor from fixing anything in the database if the migration level
+// is different from the expected value.
+func NewEngine(ctx context.Context, migrateFunc func(*xorm.Engine) error) (err error) {
 	if err = SetEngine(); err != nil {
 		return err
 	}
+
+	x.SetDefaultContext(ctx)
 
 	if err = x.Ping(); err != nil {
 		return err
@@ -291,6 +227,36 @@ func NewEngine(migrateFunc func(*xorm.Engine) error) (err error) {
 	}
 
 	return nil
+}
+
+// NamesToBean return a list of beans or an error
+func NamesToBean(names ...string) ([]interface{}, error) {
+	beans := []interface{}{}
+	if len(names) == 0 {
+		beans = append(beans, tables...)
+		return beans, nil
+	}
+	// Need to map provided names to beans...
+	beanMap := make(map[string]interface{})
+	for _, bean := range tables {
+
+		beanMap[strings.ToLower(reflect.Indirect(reflect.ValueOf(bean)).Type().Name())] = bean
+		beanMap[strings.ToLower(x.TableName(bean))] = bean
+		beanMap[strings.ToLower(x.TableName(bean, true))] = bean
+	}
+
+	gotBean := make(map[interface{}]bool)
+	for _, name := range names {
+		bean, ok := beanMap[strings.ToLower(strings.TrimSpace(name))]
+		if !ok {
+			return nil, fmt.Errorf("No table found that matches: %s", name)
+		}
+		if !gotBean[bean] {
+			beans = append(beans, bean)
+			gotBean[bean] = true
+		}
+	}
+	return beans, nil
 }
 
 // Statistic contains the database statistics
@@ -333,17 +299,74 @@ func GetStatistic() (stats Statistic) {
 
 // Ping tests if database is alive
 func Ping() error {
-	return x.Ping()
+	if x != nil {
+		return x.Ping()
+	}
+	return errors.New("database not configured")
 }
 
 // DumpDatabase dumps all data from database according the special database SQL syntax to file system.
-func DumpDatabase(filePath string, dbType string) error {
-	var tbs []*core.Table
+func DumpDatabase(filePath, dbType string) error {
+	var tbs []*schemas.Table
 	for _, t := range tables {
-		tbs = append(tbs, x.TableInfo(t).Table)
+		t, err := x.TableInfo(t)
+		if err != nil {
+			return err
+		}
+		tbs = append(tbs, t)
 	}
+
+	type Version struct {
+		ID      int64 `xorm:"pk autoincr"`
+		Version int64
+	}
+	t, err := x.TableInfo(&Version{})
+	if err != nil {
+		return err
+	}
+	tbs = append(tbs, t)
+
 	if len(dbType) > 0 {
-		return x.DumpTablesToFile(tbs, filePath, core.DbType(dbType))
+		return x.DumpTablesToFile(tbs, filePath, schemas.DBType(dbType))
 	}
 	return x.DumpTablesToFile(tbs, filePath)
+}
+
+// MaxBatchInsertSize returns the table's max batch insert size
+func MaxBatchInsertSize(bean interface{}) int {
+	t, err := x.TableInfo(bean)
+	if err != nil {
+		return 50
+	}
+	return 999 / len(t.ColumnsSeq())
+}
+
+// Count returns records number according struct's fields as database query conditions
+func Count(bean interface{}) (int64, error) {
+	return x.Count(bean)
+}
+
+// IsTableNotEmpty returns true if table has at least one record
+func IsTableNotEmpty(tableName string) (bool, error) {
+	return x.Table(tableName).Exist()
+}
+
+// DeleteAllRecords will delete all the records of this table
+func DeleteAllRecords(tableName string) error {
+	_, err := x.Exec(fmt.Sprintf("DELETE FROM %s", tableName))
+	return err
+}
+
+// GetMaxID will return max id of the table
+func GetMaxID(beanOrTableName interface{}) (maxID int64, err error) {
+	_, err = x.Select("MAX(id)").Table(beanOrTableName).Get(&maxID)
+	return
+}
+
+// FindByMaxID filled results as the condition from database
+func FindByMaxID(maxID int64, limit int, results interface{}) error {
+	return x.Where("id <= ?", maxID).
+		OrderBy("id DESC").
+		Limit(limit).
+		Find(results)
 }

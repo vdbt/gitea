@@ -6,14 +6,13 @@ package private
 
 import (
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 
 	"code.gitea.io/gitea/modules/httplib"
-	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
+	jsoniter "github.com/json-iterator/go"
 )
 
 func newRequest(url, method string) *httplib.Request {
@@ -28,6 +27,7 @@ type Response struct {
 
 func decodeJSONError(resp *http.Response) *Response {
 	var res Response
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	err := json.NewDecoder(resp.Body).Decode(&res)
 	if err != nil {
 		res.Err = err.Error()
@@ -38,6 +38,7 @@ func decodeJSONError(resp *http.Response) *Response {
 func newInternalRequest(url, method string) *httplib.Request {
 	req := newRequest(url, method).SetTLSClientConfig(&tls.Config{
 		InsecureSkipVerify: true,
+		ServerName:         setting.Domain,
 	})
 	if setting.Protocol == setting.UnixSocket {
 		req.SetTransport(&http.Transport{
@@ -47,24 +48,4 @@ func newInternalRequest(url, method string) *httplib.Request {
 		})
 	}
 	return req
-}
-
-// UpdatePublicKeyUpdated update publick key updates
-func UpdatePublicKeyUpdated(keyID int64) error {
-	// Ask for running deliver hook and test pull request tasks.
-	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/ssh/%d/update", keyID)
-	log.GitLogger.Trace("UpdatePublicKeyUpdated: %s", reqURL)
-
-	resp, err := newInternalRequest(reqURL, "POST").Response()
-	if err != nil {
-		return err
-	}
-
-	defer resp.Body.Close()
-
-	// All 2XX status codes are accepted and others will return an error
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("Failed to update public key: %s", decodeJSONError(resp).Err)
-	}
-	return nil
 }

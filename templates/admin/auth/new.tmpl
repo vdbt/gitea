@@ -1,5 +1,5 @@
 {{template "base/head" .}}
-<div class="admin new authentication">
+<div class="page-content admin new authentication">
 	{{template "admin/navbar" .}}
 	<div class="ui container">
 		{{template "base/alert" .}}
@@ -15,7 +15,7 @@
 					<div class="ui selection type dropdown">
 						<input type="hidden" id="auth_type" name="type" value="{{.type}}">
 						<div class="text">{{.CurrentTypeName}}</div>
-						<i class="dropdown icon"></i>
+						{{svg "octicon-triangle-down" 14 "dropdown icon"}}
 						<div class="menu">
 							{{range .AuthSources}}
 								<div class="item" data-value="{{.Type}}">{{.Name}}</div>
@@ -38,10 +38,15 @@
 				<div class="pam required field {{if not (eq .type 4)}}hide{{end}}">
 					<label for="pam_service_name">{{.i18n.Tr "admin.auths.pam_service_name"}}</label>
 					<input id="pam_service_name" name="pam_service_name" value="{{.pam_service_name}}" />
+					<label for="pam_email_domain">{{.i18n.Tr "admin.auths.pam_email_domain"}}</label>
+					<input id="pam_email_domain" name="pam_email_domain" value="{{.pam_email_domain}}">
 				</div>
 
 				<!-- OAuth2 -->
 				{{ template "admin/auth/source/oauth" . }}
+
+				<!-- SSPI -->
+				{{ template "admin/auth/source/sspi" . }}
 
 				<div class="ldap field">
 					<div class="ui checkbox">
@@ -102,12 +107,22 @@
 				<span>{{.i18n.Tr "admin.auths.tip.github"}}</span>
 				<li>GitLab</li>
 				<span>{{.i18n.Tr "admin.auths.tip.gitlab"}}</span>
-				<li>Google+</li>
+				<li>Google</li>
 				<span>{{.i18n.Tr "admin.auths.tip.google_plus"}}</span>
 				<li>OpenID Connect</li>
 				<span>{{.i18n.Tr "admin.auths.tip.openid_connect"}}</span>
 				<li>Twitter</li>
 				<span>{{.i18n.Tr "admin.auths.tip.twitter"}}</span>
+				<li>Discord</li>
+				<span>{{.i18n.Tr "admin.auths.tip.discord"}}</span>
+				<li>Gitea</li>
+				<span>{{.i18n.Tr "admin.auths.tip.gitea"}}</span>
+				<li>Nextcloud</li>
+				<span>{{.i18n.Tr "admin.auths.tip.nextcloud"}}</span>
+				<li>Yandex</li>
+				<span>{{.i18n.Tr "admin.auths.tip.yandex"}}</span>
+				<li>Mastodon</li>
+				<span>{{.i18n.Tr "admin.auths.tip.mastodon"}}</span>
 			</div>
 		</div>
 	</div>

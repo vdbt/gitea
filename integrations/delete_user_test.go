@@ -24,27 +24,12 @@ func assertUserDeleted(t *testing.T, userID int64) {
 	models.AssertNotExistsBean(t, &models.Star{UID: userID})
 }
 
-func TestAdminDeleteUser(t *testing.T) {
-	prepareTestEnv(t)
-
-	session := loginUser(t, "user1")
-
-	csrf := GetCSRF(t, session, "/admin/users/8")
-	req := NewRequestWithValues(t, "POST", "/admin/users/8/delete", map[string]string{
-		"_csrf": csrf,
-	})
-	session.MakeRequest(t, req, http.StatusOK)
-
-	assertUserDeleted(t, 8)
-	models.CheckConsistencyFor(t, &models.User{})
-}
-
 func TestUserDeleteAccount(t *testing.T) {
-	prepareTestEnv(t)
+	defer prepareTestEnv(t)()
 
 	session := loginUser(t, "user8")
-	csrf := GetCSRF(t, session, "/user/settings/delete")
-	urlStr := fmt.Sprintf("/user/settings/delete?password=%s", userPassword)
+	csrf := GetCSRF(t, session, "/user/settings/account")
+	urlStr := fmt.Sprintf("/user/settings/account/delete?password=%s", userPassword)
 	req := NewRequestWithValues(t, "POST", urlStr, map[string]string{
 		"_csrf": csrf,
 	})
@@ -55,11 +40,11 @@ func TestUserDeleteAccount(t *testing.T) {
 }
 
 func TestUserDeleteAccountStillOwnRepos(t *testing.T) {
-	prepareTestEnv(t)
+	defer prepareTestEnv(t)()
 
 	session := loginUser(t, "user2")
-	csrf := GetCSRF(t, session, "/user/settings/delete")
-	urlStr := fmt.Sprintf("/user/settings/delete?password=%s", userPassword)
+	csrf := GetCSRF(t, session, "/user/settings/account")
+	urlStr := fmt.Sprintf("/user/settings/account/delete?password=%s", userPassword)
 	req := NewRequestWithValues(t, "POST", urlStr, map[string]string{
 		"_csrf": csrf,
 	})

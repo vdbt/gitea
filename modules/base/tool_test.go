@@ -1,41 +1,17 @@
+// Copyright 2020 The Gitea Authors. All rights reserved.
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file.
+
 package base
 
 import (
+	"encoding/base64"
 	"os"
 	"testing"
 	"time"
 
-	"code.gitea.io/gitea/modules/setting"
-	"github.com/Unknwon/i18n"
-	macaroni18n "github.com/go-macaron/i18n"
 	"github.com/stretchr/testify/assert"
 )
-
-var BaseDate time.Time
-
-// time durations
-const (
-	DayDur   = 24 * time.Hour
-	WeekDur  = 7 * DayDur
-	MonthDur = 30 * DayDur
-	YearDur  = 12 * MonthDur
-)
-
-func TestMain(m *testing.M) {
-	// setup
-	macaroni18n.I18n(macaroni18n.Options{
-		Directory:   "../../options/locale/",
-		DefaultLang: "en-US",
-		Langs:       []string{"en-US"},
-		Names:       []string{"english"},
-	})
-	BaseDate = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
-
-	// run the tests
-	retVal := m.Run()
-
-	os.Exit(retVal)
-}
 
 func TestEncodeMD5(t *testing.T) {
 	assert.Equal(t,
@@ -51,44 +27,15 @@ func TestEncodeSha1(t *testing.T) {
 	)
 }
 
-func TestShortSha(t *testing.T) {
-	assert.Equal(t, "veryverylo", ShortSha("veryverylong"))
+func TestEncodeSha256(t *testing.T) {
+	assert.Equal(t,
+		"c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2",
+		EncodeSha256("foobar"),
+	)
 }
 
-func TestDetectEncoding(t *testing.T) {
-	testSuccess := func(b []byte, expected string) {
-		encoding, err := DetectEncoding(b)
-		assert.NoError(t, err)
-		assert.Equal(t, expected, encoding)
-	}
-	// utf-8
-	b := []byte("just some ascii")
-	testSuccess(b, "UTF-8")
-
-	// utf-8-sig: "hey" (with BOM)
-	b = []byte{0xef, 0xbb, 0xbf, 0x68, 0x65, 0x79}
-	testSuccess(b, "UTF-8")
-
-	// utf-16: "hey<accented G>"
-	b = []byte{0xff, 0xfe, 0x68, 0x00, 0x65, 0x00, 0x79, 0x00, 0xf4, 0x01}
-	testSuccess(b, "UTF-16LE")
-
-	// iso-8859-1: d<accented e>cor<newline>
-	b = []byte{0x44, 0xe9, 0x63, 0x6f, 0x72, 0x0a}
-	encoding, err := DetectEncoding(b)
-	assert.NoError(t, err)
-	// due to a race condition in `chardet` library, it could either detect
-	// "ISO-8859-1" or "IS0-8859-2" here. Technically either is correct, so
-	// we accept either.
-	assert.Contains(t, encoding, "ISO-8859")
-
-	setting.Repository.AnsiCharset = "placeholder"
-	testSuccess(b, "placeholder")
-
-	// invalid bytes
-	b = []byte{0xfa}
-	_, err = DetectEncoding(b)
-	assert.Error(t, err)
+func TestShortSha(t *testing.T) {
+	assert.Equal(t, "veryverylo", ShortSha("veryverylong"))
 }
 
 func TestBasicAuthDecode(t *testing.T) {
@@ -99,201 +46,99 @@ func TestBasicAuthDecode(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "foo", user)
 	assert.Equal(t, "bar", pass)
+
+	_, _, err = BasicAuthDecode("aW52YWxpZA==")
+	assert.Error(t, err)
+
+	_, _, err = BasicAuthDecode("invalid")
+	assert.Error(t, err)
 }
 
 func TestBasicAuthEncode(t *testing.T) {
 	assert.Equal(t, "Zm9vOmJhcg==", BasicAuthEncode("foo", "bar"))
+	assert.Equal(t, "MjM6IjotLS0t", BasicAuthEncode("23:\"", "----"))
 }
 
-func TestGetRandomString(t *testing.T) {
-	randomString, err := GetRandomString(4)
-	assert.NoError(t, err)
-	assert.Len(t, randomString, 4)
-}
-
-// TODO: Test PBKDF2()
-// TODO: Test VerifyTimeLimitCode()
-// TODO: Test CreateTimeLimitCode()
-
-func TestHashEmail(t *testing.T) {
-	assert.Equal(t,
-		"d41d8cd98f00b204e9800998ecf8427e",
-		HashEmail(""),
-	)
-	assert.Equal(t,
-		"353cbad9b58e69c96154ad99f92bedc7",
-		HashEmail("gitea@example.com"),
-	)
-}
-
-func TestAvatarLink(t *testing.T) {
-	setting.EnableFederatedAvatar = false
-	setting.LibravatarService = nil
-	setting.DisableGravatar = true
-
-	assert.Equal(t, "/img/avatar_default.png", AvatarLink(""))
-
-	setting.DisableGravatar = false
-	assert.Equal(t,
-		"353cbad9b58e69c96154ad99f92bedc7?d=identicon",
-		AvatarLink("gitea@example.com"),
-	)
-}
-
-func TestComputeTimeDiff(t *testing.T) {
-	// test that for each offset in offsets,
-	// computeTimeDiff(base + offset) == (offset, str)
-	test := func(base int64, str string, offsets ...int64) {
-		for _, offset := range offsets {
-			diff, diffStr := computeTimeDiff(base+offset, "en")
-			assert.Equal(t, offset, diff)
-			assert.Equal(t, str, diffStr)
-		}
+func TestVerifyTimeLimitCode(t *testing.T) {
+	tc := []struct {
+		data    string
+		minutes int
+		code    string
+		valid   bool
+	}{{
+		data:    "data",
+		minutes: 2,
+		code:    testCreateTimeLimitCode(t, "data", 2),
+		valid:   true,
+	}, {
+		data:    "abc123-ß",
+		minutes: 1,
+		code:    testCreateTimeLimitCode(t, "abc123-ß", 1),
+		valid:   true,
+	}, {
+		data:    "data",
+		minutes: 2,
+		code:    "2021012723240000005928251dac409d2c33a6eb82c63410aaad569bed",
+		valid:   false,
+	}}
+	for _, test := range tc {
+		actualValid := VerifyTimeLimitCode(test.data, test.minutes, test.code)
+		assert.Equal(t, test.valid, actualValid, "data: '%s' code: '%s' should be valid: %t", test.data, test.code, test.valid)
 	}
-	test(0, "now", 0)
-	test(1, "1 second", 0)
-	test(2, "2 seconds", 0)
-	test(Minute, "1 minute", 0, 1, 30, Minute-1)
-	test(2*Minute, "2 minutes", 0, Minute-1)
-	test(Hour, "1 hour", 0, 1, Hour-1)
-	test(5*Hour, "5 hours", 0, Hour-1)
-	test(Day, "1 day", 0, 1, Day-1)
-	test(5*Day, "5 days", 0, Day-1)
-	test(Week, "1 week", 0, 1, Week-1)
-	test(3*Week, "3 weeks", 0, 4*Day+25000)
-	test(Month, "1 month", 0, 1, Month-1)
-	test(10*Month, "10 months", 0, Month-1)
-	test(Year, "1 year", 0, Year-1)
-	test(3*Year, "3 years", 0, Year-1)
 }
 
-func TestMinutesToFriendly(t *testing.T) {
-	// test that a number of minutes yields the expected string
-	test := func(expected string, minutes int) {
-		actual := MinutesToFriendly(minutes, "en")
-		assert.Equal(t, expected, actual)
-	}
-	test("1 minute", 1)
-	test("2 minutes", 2)
-	test("1 hour", 60)
-	test("1 hour, 1 minute", 61)
-	test("1 hour, 2 minutes", 62)
-	test("2 hours", 120)
-}
+func testCreateTimeLimitCode(t *testing.T, data string, m int) string {
+	result0 := CreateTimeLimitCode(data, m, nil)
+	result1 := CreateTimeLimitCode(data, m, time.Now().Format("200601021504"))
+	result2 := CreateTimeLimitCode(data, m, time.Unix(time.Now().Unix()+int64(time.Minute)*int64(m), 0).Format("200601021504"))
 
-func TestTimeSince(t *testing.T) {
-	assert.Equal(t, "now", timeSince(BaseDate, BaseDate, "en"))
+	assert.Equal(t, result0, result1)
+	assert.NotEqual(t, result0, result2)
 
-	// test that each diff in `diffs` yields the expected string
-	test := func(expected string, diffs ...time.Duration) {
-		for _, diff := range diffs {
-			actual := timeSince(BaseDate, BaseDate.Add(diff), "en")
-			assert.Equal(t, i18n.Tr("en", "tool.ago", expected), actual)
-			actual = timeSince(BaseDate.Add(diff), BaseDate, "en")
-			assert.Equal(t, i18n.Tr("en", "tool.from_now", expected), actual)
-		}
-	}
-	test("1 second", time.Second, time.Second+50*time.Millisecond)
-	test("2 seconds", 2*time.Second, 2*time.Second+50*time.Millisecond)
-	test("1 minute", time.Minute, time.Minute+30*time.Second)
-	test("2 minutes", 2*time.Minute, 2*time.Minute+30*time.Second)
-	test("1 hour", time.Hour, time.Hour+30*time.Minute)
-	test("2 hours", 2*time.Hour, 2*time.Hour+30*time.Minute)
-	test("1 day", DayDur, DayDur+12*time.Hour)
-	test("2 days", 2*DayDur, 2*DayDur+12*time.Hour)
-	test("1 week", WeekDur, WeekDur+3*DayDur)
-	test("2 weeks", 2*WeekDur, 2*WeekDur+3*DayDur)
-	test("1 month", MonthDur, MonthDur+15*DayDur)
-	test("2 months", 2*MonthDur, 2*MonthDur+15*DayDur)
-	test("1 year", YearDur, YearDur+6*MonthDur)
-	test("2 years", 2*YearDur, 2*YearDur+6*MonthDur)
-}
-
-func TestTimeSincePro(t *testing.T) {
-	assert.Equal(t, "now", timeSincePro(BaseDate, BaseDate, "en"))
-
-	// test that a difference of `diff` yields the expected string
-	test := func(expected string, diff time.Duration) {
-		actual := timeSincePro(BaseDate, BaseDate.Add(diff), "en")
-		assert.Equal(t, expected, actual)
-		assert.Equal(t, "future", timeSincePro(BaseDate.Add(diff), BaseDate, "en"))
-	}
-	test("1 second", time.Second)
-	test("2 seconds", 2*time.Second)
-	test("1 minute", time.Minute)
-	test("1 minute, 1 second", time.Minute+time.Second)
-	test("1 minute, 59 seconds", time.Minute+59*time.Second)
-	test("2 minutes", 2*time.Minute)
-	test("1 hour", time.Hour)
-	test("1 hour, 1 second", time.Hour+time.Second)
-	test("1 hour, 59 minutes, 59 seconds", time.Hour+59*time.Minute+59*time.Second)
-	test("2 hours", 2*time.Hour)
-	test("1 day", DayDur)
-	test("1 day, 23 hours, 59 minutes, 59 seconds",
-		DayDur+23*time.Hour+59*time.Minute+59*time.Second)
-	test("2 days", 2*DayDur)
-	test("1 week", WeekDur)
-	test("2 weeks", 2*WeekDur)
-	test("1 month", MonthDur)
-	test("3 months", 3*MonthDur)
-	test("1 year", YearDur)
-	test("2 years, 3 months, 1 week, 2 days, 4 hours, 12 minutes, 17 seconds",
-		2*YearDur+3*MonthDur+WeekDur+2*DayDur+4*time.Hour+
-			12*time.Minute+17*time.Second)
-}
-
-func TestHtmlTimeSince(t *testing.T) {
-	setting.TimeFormat = time.UnixDate
-	// test that `diff` yields a result containing `expected`
-	test := func(expected string, diff time.Duration) {
-		actual := htmlTimeSince(BaseDate, BaseDate.Add(diff), "en")
-		assert.Contains(t, actual, `title="Sat Jan  1 00:00:00 UTC 2000"`)
-		assert.Contains(t, actual, expected)
-	}
-	test("1 second", time.Second)
-	test("3 minutes", 3*time.Minute+5*time.Second)
-	test("1 day", DayDur+18*time.Hour)
-	test("1 week", WeekDur+6*DayDur)
-	test("3 months", 3*MonthDur+3*WeekDur)
-	test("2 years", 2*YearDur)
-	test("3 years", 3*YearDur+11*MonthDur+4*WeekDur)
+	assert.True(t, len(result0) != 0)
+	return result0
 }
 
 func TestFileSize(t *testing.T) {
-	var size int64
-	size = 512
-	assert.Equal(t, "512B", FileSize(size))
-	size = size * 1024
-	assert.Equal(t, "512KB", FileSize(size))
-	size = size * 1024
-	assert.Equal(t, "512MB", FileSize(size))
-	size = size * 1024
-	assert.Equal(t, "512GB", FileSize(size))
-	size = size * 1024
-	assert.Equal(t, "512TB", FileSize(size))
-	size = size * 1024
-	assert.Equal(t, "512PB", FileSize(size))
-	size = size * 4
-	assert.Equal(t, "2.0EB", FileSize(size))
+	var size int64 = 512
+	assert.Equal(t, "512 B", FileSize(size))
+	size *= 1024
+	assert.Equal(t, "512 KiB", FileSize(size))
+	size *= 1024
+	assert.Equal(t, "512 MiB", FileSize(size))
+	size *= 1024
+	assert.Equal(t, "512 GiB", FileSize(size))
+	size *= 1024
+	assert.Equal(t, "512 TiB", FileSize(size))
+	size *= 1024
+	assert.Equal(t, "512 PiB", FileSize(size))
+	size *= 4
+	assert.Equal(t, "2.0 EiB", FileSize(size))
+}
+
+func TestPrettyNumber(t *testing.T) {
+	assert.Equal(t, "23,342,432", PrettyNumber(23342432))
+	assert.Equal(t, "0", PrettyNumber(0))
+	assert.Equal(t, "-100,000", PrettyNumber(-100000))
 }
 
 func TestSubtract(t *testing.T) {
 	toFloat64 := func(n interface{}) float64 {
-		switch n.(type) {
+		switch v := n.(type) {
 		case int:
-			return float64(n.(int))
+			return float64(v)
 		case int8:
-			return float64(n.(int8))
+			return float64(v)
 		case int16:
-			return float64(n.(int16))
+			return float64(v)
 		case int32:
-			return float64(n.(int32))
+			return float64(v)
 		case int64:
-			return float64(n.(int64))
+			return float64(v)
 		case float32:
-			return float64(n.(float32))
+			return float64(v)
 		case float64:
-			return n.(float64)
+			return v
 		default:
 			return 0.0
 		}
@@ -325,6 +170,10 @@ func TestEllipsisString(t *testing.T) {
 	assert.Equal(t, "fo...", EllipsisString("foobar", 5))
 	assert.Equal(t, "foobar", EllipsisString("foobar", 6))
 	assert.Equal(t, "foobar", EllipsisString("foobar", 10))
+	assert.Equal(t, "测...", EllipsisString("测试文本一二三四", 4))
+	assert.Equal(t, "测试...", EllipsisString("测试文本一二三四", 5))
+	assert.Equal(t, "测试文...", EllipsisString("测试文本一二三四", 6))
+	assert.Equal(t, "测试文本一二三四", EllipsisString("测试文本一二三四", 10))
 }
 
 func TestTruncateString(t *testing.T) {
@@ -336,6 +185,10 @@ func TestTruncateString(t *testing.T) {
 	assert.Equal(t, "fooba", TruncateString("foobar", 5))
 	assert.Equal(t, "foobar", TruncateString("foobar", 6))
 	assert.Equal(t, "foobar", TruncateString("foobar", 7))
+	assert.Equal(t, "测试文本", TruncateString("测试文本一二三四", 4))
+	assert.Equal(t, "测试文本一", TruncateString("测试文本一二三四", 5))
+	assert.Equal(t, "测试文本一二", TruncateString("测试文本一二三四", 6))
+	assert.Equal(t, "测试文本一二三", TruncateString("测试文本一二三四", 7))
 }
 
 func TestStringsToInt64s(t *testing.T) {
@@ -369,6 +222,13 @@ func TestInt64sToMap(t *testing.T) {
 	)
 }
 
+func TestInt64sContains(t *testing.T) {
+	assert.Equal(t, map[int64]bool{}, Int64sToMap([]int64{}))
+	assert.Equal(t, true, Int64sContains([]int64{6, 44324, 4324, 32, 1, 2323}, 1))
+	assert.Equal(t, true, Int64sContains([]int64{2323}, 2323))
+	assert.Equal(t, false, Int64sContains([]int64{6, 44324, 4324, 32, 1, 2323}, 232))
+}
+
 func TestIsLetter(t *testing.T) {
 	assert.True(t, IsLetter('a'))
 	assert.True(t, IsLetter('e'))
@@ -382,12 +242,114 @@ func TestIsLetter(t *testing.T) {
 	assert.False(t, IsLetter('-'))
 	assert.False(t, IsLetter('1'))
 	assert.False(t, IsLetter('$'))
+	assert.False(t, IsLetter(0x00))
+	assert.False(t, IsLetter(0x93))
 }
+
+func TestDetectContentTypeLongerThanSniffLen(t *testing.T) {
+	// Pre-condition: Shorter than sniffLen detects SVG.
+	assert.Equal(t, "image/svg+xml", DetectContentType([]byte(`<!-- Comment --><svg></svg>`)))
+	// Longer than sniffLen detects something else.
+	assert.Equal(t, "text/plain; charset=utf-8", DetectContentType([]byte(`<!--
+Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
+Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
+Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
+Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
+Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
+Comment Comment Comment Comment Comment Comment Comment Comment Comment Comment
+Comment Comment Comment --><svg></svg>`)))
+}
+
+// IsRepresentableAsText
 
 func TestIsTextFile(t *testing.T) {
 	assert.True(t, IsTextFile([]byte{}))
 	assert.True(t, IsTextFile([]byte("lorem ipsum")))
 }
 
-// TODO: IsImageFile(), currently no idea how to test
-// TODO: IsPDFFile(), currently no idea how to test
+func TestIsImageFile(t *testing.T) {
+	png, _ := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAAG0lEQVQYlWN4+vTpf3SMDTAMBYXYBLFpHgoKAeiOf0SGE9kbAAAAAElFTkSuQmCC")
+	assert.True(t, IsImageFile(png))
+	assert.False(t, IsImageFile([]byte("plain text")))
+}
+
+func TestIsSVGImageFile(t *testing.T) {
+	assert.True(t, IsSVGImageFile([]byte("<svg></svg>")))
+	assert.True(t, IsSVGImageFile([]byte("    <svg></svg>")))
+	assert.True(t, IsSVGImageFile([]byte(`<svg width="100"></svg>`)))
+	assert.True(t, IsSVGImageFile([]byte("<svg/>")))
+	assert.True(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?><svg></svg>`)))
+	assert.True(t, IsSVGImageFile([]byte(`<!-- Comment -->
+	<svg></svg>`)))
+	assert.True(t, IsSVGImageFile([]byte(`<!-- Multiple -->
+	<!-- Comments -->
+	<svg></svg>`)))
+	assert.True(t, IsSVGImageFile([]byte(`<!-- Multiline
+	Comment -->
+	<svg></svg>`)))
+	assert.True(t, IsSVGImageFile([]byte(`<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1 Basic//EN"
+	"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11-basic.dtd">
+	<svg></svg>`)))
+	assert.True(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+	<!-- Comment -->
+	<svg></svg>`)))
+	assert.True(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+	<!-- Multiple -->
+	<!-- Comments -->
+	<svg></svg>`)))
+	assert.True(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+	<!-- Multline
+	Comment -->
+	<svg></svg>`)))
+	assert.True(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+	<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+	<!-- Multline
+	Comment -->
+	<svg></svg>`)))
+	assert.False(t, IsSVGImageFile([]byte{}))
+	assert.False(t, IsSVGImageFile([]byte("svg")))
+	assert.False(t, IsSVGImageFile([]byte("<svgfoo></svgfoo>")))
+	assert.False(t, IsSVGImageFile([]byte("text<svg></svg>")))
+	assert.False(t, IsSVGImageFile([]byte("<html><body><svg></svg></body></html>")))
+	assert.False(t, IsSVGImageFile([]byte(`<script>"<svg></svg>"</script>`)))
+	assert.False(t, IsSVGImageFile([]byte(`<!-- <svg></svg> inside comment -->
+	<foo></foo>`)))
+	assert.False(t, IsSVGImageFile([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+	<!-- <svg></svg> inside comment -->
+	<foo></foo>`)))
+}
+
+func TestIsPDFFile(t *testing.T) {
+	pdf, _ := base64.StdEncoding.DecodeString("JVBERi0xLjYKJcOkw7zDtsOfCjIgMCBvYmoKPDwvTGVuZ3RoIDMgMCBSL0ZpbHRlci9GbGF0ZURlY29kZT4+CnN0cmVhbQp4nF3NPwsCMQwF8D2f4s2CNYk1baF0EHRwOwg4iJt/NsFb/PpevUE4Mjwe")
+	assert.True(t, IsPDFFile(pdf))
+	assert.False(t, IsPDFFile([]byte("plain text")))
+}
+
+func TestIsVideoFile(t *testing.T) {
+	mp4, _ := base64.StdEncoding.DecodeString("AAAAGGZ0eXBtcDQyAAAAAGlzb21tcDQyAAEI721vb3YAAABsbXZoZAAAAADaBlwX2gZcFwAAA+gA")
+	assert.True(t, IsVideoFile(mp4))
+	assert.False(t, IsVideoFile([]byte("plain text")))
+}
+
+func TestIsAudioFile(t *testing.T) {
+	mp3, _ := base64.StdEncoding.DecodeString("SUQzBAAAAAABAFRYWFgAAAASAAADbWFqb3JfYnJhbmQAbXA0MgBUWFhYAAAAEQAAA21pbm9yX3Zl")
+	assert.True(t, IsAudioFile(mp3))
+	assert.False(t, IsAudioFile([]byte("plain text")))
+}
+
+// TODO: Test EntryIcon
+
+func TestSetupGiteaRoot(t *testing.T) {
+	_ = os.Setenv("GITEA_ROOT", "test")
+	assert.EqualValues(t, "test", SetupGiteaRoot())
+	_ = os.Setenv("GITEA_ROOT", "")
+	assert.NotEqual(t, "test", SetupGiteaRoot())
+}
+
+func TestFormatNumberSI(t *testing.T) {
+	assert.Equal(t, "125", FormatNumberSI(int(125)))
+	assert.Equal(t, "1.3k", FormatNumberSI(int64(1317)))
+	assert.Equal(t, "21.3M", FormatNumberSI(21317675))
+	assert.Equal(t, "45.7G", FormatNumberSI(45721317675))
+	assert.Equal(t, "", FormatNumberSI("test"))
+}

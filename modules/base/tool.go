@@ -6,40 +6,57 @@ package base
 
 import (
 	"crypto/md5"
-	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"html/template"
-	"io"
-	"math"
-	"math/big"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
-	"github.com/Unknwon/com"
-	"github.com/Unknwon/i18n"
-	"github.com/gogits/chardet"
+
+	"github.com/dustin/go-humanize"
 )
+
+// Use at most this many bytes to determine Content Type.
+const sniffLen = 512
+
+// SVGMimeType MIME type of SVG images.
+const SVGMimeType = "image/svg+xml"
+
+var svgTagRegex = regexp.MustCompile(`(?si)\A\s*(?:(<!--.*?-->|<!DOCTYPE\s+svg([\s:]+.*?>|>))\s*)*<svg[\s>\/]`)
+var svgTagInXMLRegex = regexp.MustCompile(`(?si)\A<\?xml\b.*?\?>\s*(?:(<!--.*?-->|<!DOCTYPE\s+svg([\s:]+.*?>|>))\s*)*<svg[\s>\/]`)
 
 // EncodeMD5 encodes string to md5 hex value.
 func EncodeMD5(str string) string {
 	m := md5.New()
-	m.Write([]byte(str))
+	_, _ = m.Write([]byte(str))
 	return hex.EncodeToString(m.Sum(nil))
 }
 
 // EncodeSha1 string to sha1 hex value.
 func EncodeSha1(str string) string {
 	h := sha1.New()
-	h.Write([]byte(str))
+	_, _ = h.Write([]byte(str))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// EncodeSha256 string to sha1 hex value.
+func EncodeSha256(str string) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(str))
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -47,26 +64,6 @@ func EncodeSha1(str string) string {
 // It is DEPRECATED and will be removed in the future.
 func ShortSha(sha1 string) string {
 	return TruncateString(sha1, 10)
-}
-
-// DetectEncoding detect the encoding of content
-func DetectEncoding(content []byte) (string, error) {
-	if utf8.Valid(content) {
-		log.Debug("Detected encoding: utf-8 (fast)")
-		return "UTF-8", nil
-	}
-
-	result, err := chardet.NewTextDetector().DetectBest(content)
-	if err != nil {
-		return "", err
-	}
-	if result.Charset != "UTF-8" && len(setting.Repository.AnsiCharset) > 0 {
-		log.Debug("Using default AnsiCharset: %s", setting.Repository.AnsiCharset)
-		return setting.Repository.AnsiCharset, err
-	}
-
-	log.Debug("Detected encoding: %s", result.Charset)
-	return result.Charset, err
 }
 
 // BasicAuthDecode decode basic auth string
@@ -77,52 +74,17 @@ func BasicAuthDecode(encoded string) (string, string, error) {
 	}
 
 	auth := strings.SplitN(string(s), ":", 2)
+
+	if len(auth) != 2 {
+		return "", "", errors.New("invalid basic authentication")
+	}
+
 	return auth[0], auth[1], nil
 }
 
 // BasicAuthEncode encode basic auth string
 func BasicAuthEncode(username, password string) string {
 	return base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
-}
-
-// GetRandomString generate random string by specify chars.
-func GetRandomString(n int) (string, error) {
-	const alphanum = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
-	buffer := make([]byte, n)
-	max := big.NewInt(int64(len(alphanum)))
-
-	for i := 0; i < n; i++ {
-		index, err := randomInt(max)
-		if err != nil {
-			return "", err
-		}
-
-		buffer[i] = alphanum[index]
-	}
-
-	return string(buffer), nil
-}
-
-// GetRandomBytesAsBase64 generates a random base64 string from n bytes
-func GetRandomBytesAsBase64(n int) string {
-	bytes := make([]byte, 32)
-	_, err := io.ReadFull(rand.Reader, bytes)
-
-	if err != nil {
-		log.Fatal(4, "Error reading random bytes: %v", err)
-	}
-
-	return base64.RawURLEncoding.EncodeToString(bytes)
-}
-
-func randomInt(max *big.Int) (int, error) {
-	rand, err := rand.Int(rand.Reader, max)
-	if err != nil {
-		return 0, err
-	}
-
-	return int(rand.Int64()), nil
 }
 
 // VerifyTimeLimitCode verify time limit code
@@ -134,8 +96,8 @@ func VerifyTimeLimitCode(data string, minutes int, code string) bool {
 	// split code
 	start := code[:12]
 	lives := code[12:18]
-	if d, err := com.StrTo(lives).Int(); err == nil {
-		minutes = d
+	if d, err := strconv.ParseInt(lives, 10, 0); err == nil {
+		minutes = int(d)
 	}
 
 	// right active code
@@ -179,221 +141,22 @@ func CreateTimeLimitCode(data string, minutes int, startInf interface{}) string 
 
 	// create sha1 encode string
 	sh := sha1.New()
-	sh.Write([]byte(data + setting.SecretKey + startStr + endStr + com.ToStr(minutes)))
+	_, _ = sh.Write([]byte(fmt.Sprintf("%s%s%s%s%d", data, setting.SecretKey, startStr, endStr, minutes)))
 	encoded := hex.EncodeToString(sh.Sum(nil))
 
 	code := fmt.Sprintf("%s%06d%s", startStr, minutes, encoded)
 	return code
 }
 
-// HashEmail hashes email address to MD5 string.
-// https://en.gravatar.com/site/implement/hash/
-func HashEmail(email string) string {
-	return EncodeMD5(strings.ToLower(strings.TrimSpace(email)))
-}
-
-// DefaultAvatarLink the default avatar link
-func DefaultAvatarLink() string {
-	return setting.AppSubURL + "/img/avatar_default.png"
-}
-
-// AvatarLink returns relative avatar link to the site domain by given email,
-// which includes app sub-url as prefix. However, it is possible
-// to return full URL if user enables Gravatar-like service.
-func AvatarLink(email string) string {
-	if setting.EnableFederatedAvatar && setting.LibravatarService != nil {
-		url, err := setting.LibravatarService.FromEmail(email)
-		if err != nil {
-			log.Error(4, "LibravatarService.FromEmail(email=%s): error %v", email, err)
-			return DefaultAvatarLink()
-		}
-		return url
-	}
-
-	if !setting.DisableGravatar {
-		return setting.GravatarSource + HashEmail(email) + "?d=identicon"
-	}
-
-	return DefaultAvatarLink()
-}
-
-// Seconds-based time units
-const (
-	Minute = 60
-	Hour   = 60 * Minute
-	Day    = 24 * Hour
-	Week   = 7 * Day
-	Month  = 30 * Day
-	Year   = 12 * Month
-)
-
-func computeTimeDiff(diff int64, lang string) (int64, string) {
-	diffStr := ""
-	switch {
-	case diff <= 0:
-		diff = 0
-		diffStr = i18n.Tr(lang, "tool.now")
-	case diff < 2:
-		diff = 0
-		diffStr = i18n.Tr(lang, "tool.1s")
-	case diff < 1*Minute:
-		diffStr = i18n.Tr(lang, "tool.seconds", diff)
-		diff = 0
-
-	case diff < 2*Minute:
-		diff -= 1 * Minute
-		diffStr = i18n.Tr(lang, "tool.1m")
-	case diff < 1*Hour:
-		diffStr = i18n.Tr(lang, "tool.minutes", diff/Minute)
-		diff -= diff / Minute * Minute
-
-	case diff < 2*Hour:
-		diff -= 1 * Hour
-		diffStr = i18n.Tr(lang, "tool.1h")
-	case diff < 1*Day:
-		diffStr = i18n.Tr(lang, "tool.hours", diff/Hour)
-		diff -= diff / Hour * Hour
-
-	case diff < 2*Day:
-		diff -= 1 * Day
-		diffStr = i18n.Tr(lang, "tool.1d")
-	case diff < 1*Week:
-		diffStr = i18n.Tr(lang, "tool.days", diff/Day)
-		diff -= diff / Day * Day
-
-	case diff < 2*Week:
-		diff -= 1 * Week
-		diffStr = i18n.Tr(lang, "tool.1w")
-	case diff < 1*Month:
-		diffStr = i18n.Tr(lang, "tool.weeks", diff/Week)
-		diff -= diff / Week * Week
-
-	case diff < 2*Month:
-		diff -= 1 * Month
-		diffStr = i18n.Tr(lang, "tool.1mon")
-	case diff < 1*Year:
-		diffStr = i18n.Tr(lang, "tool.months", diff/Month)
-		diff -= diff / Month * Month
-
-	case diff < 2*Year:
-		diff -= 1 * Year
-		diffStr = i18n.Tr(lang, "tool.1y")
-	default:
-		diffStr = i18n.Tr(lang, "tool.years", diff/Year)
-		diff -= (diff / Year) * Year
-	}
-	return diff, diffStr
-}
-
-// MinutesToFriendly returns a user friendly string with number of minutes
-// converted to hours and minutes.
-func MinutesToFriendly(minutes int, lang string) string {
-	duration := time.Duration(minutes) * time.Minute
-	return TimeSincePro(time.Now().Add(-duration), lang)
-}
-
-// TimeSincePro calculates the time interval and generate full user-friendly string.
-func TimeSincePro(then time.Time, lang string) string {
-	return timeSincePro(then, time.Now(), lang)
-}
-
-func timeSincePro(then, now time.Time, lang string) string {
-	diff := now.Unix() - then.Unix()
-
-	if then.After(now) {
-		return i18n.Tr(lang, "tool.future")
-	}
-	if diff == 0 {
-		return i18n.Tr(lang, "tool.now")
-	}
-
-	var timeStr, diffStr string
-	for {
-		if diff == 0 {
-			break
-		}
-
-		diff, diffStr = computeTimeDiff(diff, lang)
-		timeStr += ", " + diffStr
-	}
-	return strings.TrimPrefix(timeStr, ", ")
-}
-
-func timeSince(then, now time.Time, lang string) string {
-	lbl := "tool.ago"
-	diff := now.Unix() - then.Unix()
-	if then.After(now) {
-		lbl = "tool.from_now"
-		diff = then.Unix() - now.Unix()
-	}
-	if diff <= 0 {
-		return i18n.Tr(lang, "tool.now")
-	}
-
-	_, diffStr := computeTimeDiff(diff, lang)
-	return i18n.Tr(lang, lbl, diffStr)
-}
-
-// RawTimeSince retrieves i18n key of time since t
-func RawTimeSince(t time.Time, lang string) string {
-	return timeSince(t, time.Now(), lang)
-}
-
-// TimeSince calculates the time interval and generate user-friendly string.
-func TimeSince(then time.Time, lang string) template.HTML {
-	return htmlTimeSince(then, time.Now(), lang)
-}
-
-func htmlTimeSince(then, now time.Time, lang string) template.HTML {
-	return template.HTML(fmt.Sprintf(`<span class="time-since" title="%s">%s</span>`,
-		then.Format(setting.TimeFormat),
-		timeSince(then, now, lang)))
-}
-
-// Storage space size types
-const (
-	Byte  = 1
-	KByte = Byte * 1024
-	MByte = KByte * 1024
-	GByte = MByte * 1024
-	TByte = GByte * 1024
-	PByte = TByte * 1024
-	EByte = PByte * 1024
-)
-
-var bytesSizeTable = map[string]uint64{
-	"b":  Byte,
-	"kb": KByte,
-	"mb": MByte,
-	"gb": GByte,
-	"tb": TByte,
-	"pb": PByte,
-	"eb": EByte,
-}
-
-func logn(n, b float64) float64 {
-	return math.Log(n) / math.Log(b)
-}
-
-func humanateBytes(s uint64, base float64, sizes []string) string {
-	if s < 10 {
-		return fmt.Sprintf("%dB", s)
-	}
-	e := math.Floor(logn(float64(s), base))
-	suffix := sizes[int(e)]
-	val := float64(s) / math.Pow(base, math.Floor(e))
-	f := "%.0f"
-	if val < 10 {
-		f = "%.1f"
-	}
-
-	return fmt.Sprintf(f+"%s", val, suffix)
-}
-
 // FileSize calculates the file size and generate user-friendly string.
 func FileSize(s int64) string {
-	sizes := []string{"B", "KB", "MB", "GB", "TB", "PB", "EB"}
-	return humanateBytes(uint64(s), 1024, sizes)
+	return humanize.IBytes(uint64(s))
+}
+
+// PrettyNumber produces a string form of the given number in base 10 with
+// commas after every three orders of magnitud
+func PrettyNumber(v int64) string {
+	return humanize.Comma(v)
 }
 
 // Subtract deals with subtraction of all types of number.
@@ -401,41 +164,41 @@ func Subtract(left interface{}, right interface{}) interface{} {
 	var rleft, rright int64
 	var fleft, fright float64
 	var isInt = true
-	switch left.(type) {
+	switch v := left.(type) {
 	case int:
-		rleft = int64(left.(int))
+		rleft = int64(v)
 	case int8:
-		rleft = int64(left.(int8))
+		rleft = int64(v)
 	case int16:
-		rleft = int64(left.(int16))
+		rleft = int64(v)
 	case int32:
-		rleft = int64(left.(int32))
+		rleft = int64(v)
 	case int64:
-		rleft = left.(int64)
+		rleft = v
 	case float32:
-		fleft = float64(left.(float32))
+		fleft = float64(v)
 		isInt = false
 	case float64:
-		fleft = left.(float64)
+		fleft = v
 		isInt = false
 	}
 
-	switch right.(type) {
+	switch v := right.(type) {
 	case int:
-		rright = int64(right.(int))
+		rright = int64(v)
 	case int8:
-		rright = int64(right.(int8))
+		rright = int64(v)
 	case int16:
-		rright = int64(right.(int16))
+		rright = int64(v)
 	case int32:
-		rright = int64(right.(int32))
+		rright = int64(v)
 	case int64:
-		rright = right.(int64)
+		rright = v
 	case float32:
-		fright = float64(right.(float32))
+		fright = float64(v)
 		isInt = false
 	case float64:
-		fright = right.(float64)
+		fright = v
 		isInt = false
 	}
 
@@ -451,26 +214,26 @@ func EllipsisString(str string, length int) string {
 	if length <= 3 {
 		return "..."
 	}
-	if len(str) <= length {
+	if utf8.RuneCountInString(str) <= length {
 		return str
 	}
-	return str[:length-3] + "..."
+	return string([]rune(str)[:length-3]) + "..."
 }
 
 // TruncateString returns a truncated string with given limit,
 // it returns input string if length is not reached limit.
 func TruncateString(str string, limit int) string {
-	if len(str) < limit {
+	if utf8.RuneCountInString(str) < limit {
 		return str
 	}
-	return str[:limit]
+	return string([]rune(str)[:limit])
 }
 
 // StringsToInt64s converts a slice of string to a slice of int64.
 func StringsToInt64s(strs []string) ([]int64, error) {
 	ints := make([]int64, len(strs))
 	for i := range strs {
-		n, err := com.StrTo(strs[i]).Int64()
+		n, err := strconv.ParseInt(strs[i], 10, 64)
 		if err != nil {
 			return ints, err
 		}
@@ -508,9 +271,33 @@ func Int64sContains(intsSlice []int64, a int64) bool {
 }
 
 // IsLetter reports whether the rune is a letter (category L).
-// https://github.com/golang/go/blob/master/src/go/scanner/scanner.go#L257
+// https://github.com/golang/go/blob/c3b4918/src/go/scanner/scanner.go#L342
 func IsLetter(ch rune) bool {
 	return 'a' <= ch && ch <= 'z' || 'A' <= ch && ch <= 'Z' || ch == '_' || ch >= 0x80 && unicode.IsLetter(ch)
+}
+
+// DetectContentType extends http.DetectContentType with more content types.
+func DetectContentType(data []byte) string {
+	ct := http.DetectContentType(data)
+
+	if len(data) > sniffLen {
+		data = data[:sniffLen]
+	}
+
+	if setting.UI.SVG.Enabled &&
+		((strings.Contains(ct, "text/plain") || strings.Contains(ct, "text/html")) && svgTagRegex.Match(data) ||
+			strings.Contains(ct, "text/xml") && svgTagInXMLRegex.Match(data)) {
+
+		// SVG is unsupported.  https://github.com/golang/go/issues/15888
+		return SVGMimeType
+	}
+	return ct
+}
+
+// IsRepresentableAsText returns true if file content can be represented as
+// plain text or is empty.
+func IsRepresentableAsText(data []byte) bool {
+	return IsTextFile(data) || IsSVGImageFile(data)
 }
 
 // IsTextFile returns true if file content format is plain text or empty.
@@ -518,20 +305,98 @@ func IsTextFile(data []byte) bool {
 	if len(data) == 0 {
 		return true
 	}
-	return strings.Index(http.DetectContentType(data), "text/") != -1
+	return strings.Contains(DetectContentType(data), "text/")
 }
 
 // IsImageFile detects if data is an image format
 func IsImageFile(data []byte) bool {
-	return strings.Index(http.DetectContentType(data), "image/") != -1
+	return strings.Contains(DetectContentType(data), "image/")
+}
+
+// IsSVGImageFile detects if data is an SVG image format
+func IsSVGImageFile(data []byte) bool {
+	return strings.Contains(DetectContentType(data), SVGMimeType)
 }
 
 // IsPDFFile detects if data is a pdf format
 func IsPDFFile(data []byte) bool {
-	return strings.Index(http.DetectContentType(data), "application/pdf") != -1
+	return strings.Contains(DetectContentType(data), "application/pdf")
 }
 
 // IsVideoFile detects if data is an video format
 func IsVideoFile(data []byte) bool {
-	return strings.Index(http.DetectContentType(data), "video/") != -1
+	return strings.Contains(DetectContentType(data), "video/")
+}
+
+// IsAudioFile detects if data is an video format
+func IsAudioFile(data []byte) bool {
+	return strings.Contains(DetectContentType(data), "audio/")
+}
+
+// EntryIcon returns the octicon class for displaying files/directories
+func EntryIcon(entry *git.TreeEntry) string {
+	switch {
+	case entry.IsLink():
+		te, err := entry.FollowLink()
+		if err != nil {
+			log.Debug(err.Error())
+			return "file-symlink-file"
+		}
+		if te.IsDir() {
+			return "file-submodule"
+		}
+		return "file-symlink-file"
+	case entry.IsDir():
+		return "file-directory"
+	case entry.IsSubModule():
+		return "file-submodule"
+	}
+
+	return "file"
+}
+
+// SetupGiteaRoot Sets GITEA_ROOT if it is not already set and returns the value
+func SetupGiteaRoot() string {
+	giteaRoot := os.Getenv("GITEA_ROOT")
+	if giteaRoot == "" {
+		_, filename, _, _ := runtime.Caller(0)
+		giteaRoot = strings.TrimSuffix(filename, "modules/base/tool.go")
+		wd, err := os.Getwd()
+		if err != nil {
+			rel, err := filepath.Rel(giteaRoot, wd)
+			if err != nil && strings.HasPrefix(filepath.ToSlash(rel), "../") {
+				giteaRoot = wd
+			}
+		}
+		if _, err := os.Stat(filepath.Join(giteaRoot, "gitea")); os.IsNotExist(err) {
+			giteaRoot = ""
+		} else if err := os.Setenv("GITEA_ROOT", giteaRoot); err != nil {
+			giteaRoot = ""
+		}
+	}
+	return giteaRoot
+}
+
+// FormatNumberSI format a number
+func FormatNumberSI(data interface{}) string {
+	var num int64
+	if num1, ok := data.(int64); ok {
+		num = num1
+	} else if num1, ok := data.(int); ok {
+		num = int64(num1)
+	} else {
+		return ""
+	}
+
+	if num < 1000 {
+		return fmt.Sprintf("%d", num)
+	} else if num < 1000000 {
+		num2 := float32(num) / float32(1000.0)
+		return fmt.Sprintf("%.1fk", num2)
+	} else if num < 1000000000 {
+		num2 := float32(num) / float32(1000000.0)
+		return fmt.Sprintf("%.1fM", num2)
+	}
+	num2 := float32(num) / float32(1000000000.0)
+	return fmt.Sprintf("%.1fG", num2)
 }

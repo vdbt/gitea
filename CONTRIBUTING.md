@@ -11,11 +11,14 @@
   - [Translation](#translation)
   - [Code review](#code-review)
   - [Styleguide](#styleguide)
-  - [Sign your work](#sign-your-work)
+  - [Design guideline](#design-guideline)
+  - [API v1](#api-v1)
+  - [Developer Certificate of Origin (DCO)](#developer-certificate-of-origin-dco)
   - [Release Cycle](#release-cycle)
   - [Maintainers](#maintainers)
   - [Owners](#owners)
   - [Versions](#versions)
+  - [Releasing Gitea](#releasing-gitea)
   - [Copyright](#copyright)
 
 ## Introduction
@@ -48,10 +51,12 @@ getting free help.
 
 ## Discuss your design
 
-The project welcomes submissions. If you want to change or add something, 
-please let everyone know what you're working on—[file an issue](https://github.com/go-gitea/gitea/issues/new)! 
-Significant changes must go through the [change proposal process](https://github.com/go-gitea/proposals) 
-before they can be accepted.
+The project welcomes submissions. If you want to change or add something,
+please let everyone know what you're working on—[file an issue](https://github.com/go-gitea/gitea/issues/new)!
+Significant changes must go through the change proposal process
+before they can be accepted. To create a proposal, file an issue with
+your proposed changes documented, and make sure to note in the title
+of the issue that it is a proposal.
 
 This process gives everyone a chance to validate the design, helps
 prevent duplication of effort, and ensures that the idea fits inside
@@ -61,20 +66,31 @@ high-level discussions.
 
 ## Testing redux
 
-Before sending code out for review, run all the tests for the
-whole tree to make sure the changes don't break other usage
-and keep the compatibility on upgrade. To make sure you are
-running the test suite exactly like we do, you should install
-the CLI for [Drone CI](https://github.com/drone/drone), as
-we are using the server for continous testing, following [these
-instructions](http://readme.drone.io/usage/getting-started-cli). After that, 
-you can simply call `drone exec` within your working directory and it will try 
-to run the test suite locally.
+Before submitting a pull request, run all the tests for the whole tree
+to make sure your changes don't cause regression elsewhere.
+
+Here's how to run the test suite:
+
+- code lint
+
+|                       |                                                                   |
+| :-------------------- | :---------------------------------------------------------------- |
+|``make lint``          | lint everything (not suggest if you only change one type code)    |
+|``make lint-frontend`` | lint frontend files  |
+|``make lint-backend``  | lint backend files   |
+
+- run test code (Suggest run in linux)  
+
+|                                        |                                                  |
+| :------------------------------------- | :----------------------------------------------- |
+|``make test[\#TestSpecificName]``       |  run unit test  |
+|``make test-sqlite[\#TestSpecificName]``|  run [integration](integrations) test for sqlite |  
+|[More detail message about integrations](integrations/README.md)  |
 
 ## Vendoring
 
 We keep a cached copy of dependencies within the `vendor/` directory,
-managing updates via [govendor](http://github.com/kardianos/govendor).
+managing updates via [Modules](https://golang.org/cmd/go/#hdr-Module_maintenance).
 
 Pull requests should only include `vendor/` updates if they are part of
 the same change, be it a bugfix or a feature addition.
@@ -83,24 +99,20 @@ The `vendor/` update needs to be justified as part of the PR description,
 and must be verified by the reviewers and/or merger to always reference
 an existing upstream commit.
 
+You can find more information on how to get started with it on the [Modules Wiki](https://github.com/golang/go/wiki/Modules).
+
 ## Translation
 
 We do all translation work inside [Crowdin](https://crowdin.com/project/gitea).
 The only translation that is maintained in this git repository is
 [`en_US.ini`](https://github.com/go-gitea/gitea/blob/master/options/locale/locale_en-US.ini)
-and is synced regularily to Crowdin. Once a translation has reached
+and is synced regularly to Crowdin. Once a translation has reached
 A SATISFACTORY PERCENTAGE it will be synced back into this repo and
 included in the next released version.
 
 ## Building Gitea
 
-Generally, the go build tools are installed as-needed in the `Makefile`.
-An exception are the tools to build the CSS and images.
-
-- To build CSS: Install [Node.js](https://nodejs.org/en/download/package-manager)
-  with `npm` and then run `npm install` and `make stylesheets`.
-- To build Images: ImageMagick, inkscape and zopflipng binaries must be
-  available in your `PATH` to run `make generate-images`.
+See the [hacking instructions](https://docs.gitea.io/en-us/hacking-on-gitea/).
 
 ## Code review
 
@@ -109,8 +121,8 @@ makes the change, even if they are an owner or a maintainer. We use GitHub's
 pull request workflow to do that. And, we also use [LGTM](http://lgtm.co)
 to ensure every PR is reviewed by at least 2 maintainers.
 
-Please try to make your pull request easy to review for us. And, please read 
-the *[How to get faster PR reviews](https://github.com/kubernetes/community/blob/master/contributors/devel/faster_reviews.md)* guide;
+Please try to make your pull request easy to review for us. And, please read
+the *[How to get faster PR reviews](https://github.com/kubernetes/community/blob/261cb0fd089b64002c91e8eddceebf032462ccd6/contributors/guide/pull-requests.md#best-practices-for-faster-reviews)* guide;
 it has lots of useful tips for any project you may want to contribute.
 Some of the key points:
 
@@ -141,22 +153,74 @@ import (
 )
 ```
 
-## Sign-off your work
+## Design guideline
 
-The sign-off is a simple line at the end of the explanation for the
-patch. Your signature certifies that you wrote the patch or otherwise
-have the right to pass it on as an open-source patch. The rules are
-pretty simple: If you can certify [DCO](DCO), then you just add a line
-to every git commit message:
+To maintain understandable code and avoid circular dependencies it is important to have a good structure of the code. The gitea code is divided into the following parts:
+
+- **integration:** Integrations tests
+- **models:** Contains the data structures used by xorm to construct database tables. It also contains supporting functions to query and update the database. Dependencies to other code in Gitea should be avoided although some modules might be needed (for example for logging).
+- **models/fixtures:** Sample model data used in integration tests.
+- **models/migrations:** Handling of database migrations between versions. PRs that changes a database structure shall also have a migration step.
+- **modules:** Different modules to handle specific functionality in Gitea.
+- **public:** Frontend files (javascript, images, css, etc.)
+- **routers:** Handling of server requests. As it uses other Gitea packages to serve the request, other packages (models, modules or services) shall not depend on routers
+- **services:** Support functions for common routing operations. Uses models and modules to handle the request.
+- **templates:** Golang templates for generating the html output.
+- **vendor:** External code that Gitea depends on.
+
+## API v1
+
+The API is documented by [swagger](http://try.gitea.io/api/swagger) and is based on [GitHub API v3](https://developer.github.com/v3/).
+Thus, Gitea´s API should use the same endpoints and fields as GitHub´s API as far as possible, unless there are good reasons to deviate.  
+If Gitea provides functionality that GitHub does not, a new endpoint can be created.  
+If information is provided by Gitea that is not provided by the GitHub API, a new field can be used that doesn't collide with any GitHub fields.
+
+Updating an existing API should not remove existing fields unless there is a really good reason to do so.
+The same applies to status responses. If you notice a problem, feel free to leave a comment in the code for future refactoring to APIv2 (which is currently not planned).
+
+All expected results (errors, success, fail messages) should be documented
+([example](https://github.com/go-gitea/gitea/blob/c620eb5b2d0d874da68ebd734d3864c5224f71f7/routers/api/v1/repo/issue.go#L319-L327)).
+
+All JSON input types must be defined as a struct in [modules/structs/](modules/structs/)
+([example](https://github.com/go-gitea/gitea/blob/c620eb5b2d0d874da68ebd734d3864c5224f71f7/modules/structs/issue.go#L76-L91))
+and referenced in
+[routers/api/v1/swagger/options.go](https://github.com/go-gitea/gitea/blob/c620eb5b2d0d874da68ebd734d3864c5224f71f7/routers/api/v1/swagger/options.go).  
+They can then be used like the following:
+([example](https://github.com/go-gitea/gitea/blob/c620eb5b2d0d874da68ebd734d3864c5224f71f7/routers/api/v1/repo/issue.go#L318)).
+
+All JSON responses must be defined as a struct in [modules/structs/](modules/structs/)
+([example](https://github.com/go-gitea/gitea/blob/c620eb5b2d0d874da68ebd734d3864c5224f71f7/modules/structs/issue.go#L36-L68))
+and referenced in its category in [routers/api/v1/swagger/](routers/api/v1/swagger/)
+([example](https://github.com/go-gitea/gitea/blob/c620eb5b2d0d874da68ebd734d3864c5224f71f7/routers/api/v1/swagger/issue.go#L11-L16))  
+They can be used like the following:
+([example](https://github.com/go-gitea/gitea/blob/c620eb5b2d0d874da68ebd734d3864c5224f71f7/routers/api/v1/repo/issue.go#L277-L279))
+
+In general, HTTP methods are chosen as follows:
+ * **GET** endpoints return requested object and status **OK (200)**
+ * **DELETE** endpoints return status **No Content (204)**
+ * **POST** endpoints return status **Created (201)**, used to **create** new objects (e.g. a User)
+ * **PUT** endpoints return status **No Content (204)**, used to **add/assign** existing Objects (e.g. User) to something (e.g. Org-Team)
+ * **PATCH** endpoints return changed object and status **OK (200)**, used to **edit/change** an existing object
+
+
+An endpoint which changes/edits an object expects all fields to be optional (except ones to identify the object, which are required).
+
+
+## Developer Certificate of Origin (DCO)
+
+We consider the act of contributing to the code by submitting a Pull
+Request as the "Sign off" or agreement to the certifications and terms
+of the [DCO](DCO) and [MIT license](LICENSE). No further action is required.
+Additionally you could add a line at the end of your commit message.
 
 ```
 Signed-off-by: Joe Smith <joe.smith@email.com>
 ```
 
-Please use your real name; we really dislike pseudonyms or anonymous
-contributions. We are in the open-source world without secrets. If you
-set your `user.name` and `user.email` git configs, you can sign-off your
-commit automatically with `git commit -s`.
+If you set your `user.name` and `user.email` git configs, you can add the
+line to the end of your commit automatically with `git commit -s`.
+
+We assume in good faith that the information you provide is legally binding.
 
 ## Release Cycle
 
@@ -172,11 +236,11 @@ obtain a final version that is maintained in this branch. A release is
 maintained by issuing patch releases to only correct critical problems
 such as crashes or security issues.
 
-Major release cycles are bimonthly. They always begin on the 25th and end on 
-the 24th (i.e., the 25th of December to February 24th). 
+Major release cycles are bimonthly. They always begin on the 25th and end on
+the 24th (i.e., the 25th of December to February 24th).
 
-During a development cycle, we may also publish any necessary minor releases 
-for the previous version. For example, if the latest, published release is 
+During a development cycle, we may also publish any necessary minor releases
+for the previous version. For example, if the latest, published release is
 v1.2, then minor changes for the previous release—e.g., v1.1.0 -> v1.1.1—are
 still possible.
 
@@ -197,6 +261,10 @@ an advisor has time to code review, we will gladly welcome them back
 to the maintainers team. If a maintainer is inactive for more than 3
 months and forgets to leave the maintainers team, the owners may move
 him or her from the maintainers team to the advisors team.
+For security reasons, Maintainers should use 2FA for their accounts and
+if possible provide gpg signed commits.
+https://help.github.com/articles/securing-your-account-with-two-factor-authentication-2fa/
+https://help.github.com/articles/signing-commits-with-gpg/
 
 ## Owners
 
@@ -207,6 +275,9 @@ be the main owner, and the other two the assistant owners. When the new
 owners have been elected, the old owners will give up ownership to the
 newly elected owners. If an owner is unable to do so, the other owners
 will assist in ceding ownership to the newly elected owners.
+For security reasons, Owners or any account with write access (like a bot)
+must use 2FA.
+https://help.github.com/articles/securing-your-account-with-two-factor-authentication-2fa/
 
 After the election, the new owners should proactively agree
 with our [CONTRIBUTING](CONTRIBUTING.md) requirements in the
@@ -221,6 +292,26 @@ and lead the development of Gitea.
 
 To honor the past owners, here's the history of the owners and the time
 they served:
+
+* 2021-01-01 ~ 2021-12-31 - https://github.com/go-gitea/gitea/issues/13801
+  * [Lunny Xiao](https://gitea.com/lunny) <xiaolunwen@gmail.com>
+  * [Lauris Bukšis-Haberkorns](https://gitea.com/lafriks) <lauris@nix.lv>
+  * [Matti Ranta](https://gitea.com/techknowlogick) <techknowlogick@gitea.io>
+
+* 2020-01-01 ~ 2020-12-31 - https://github.com/go-gitea/gitea/issues/9230
+  * [Lunny Xiao](https://gitea.com/lunny) <xiaolunwen@gmail.com>
+  * [Lauris Bukšis-Haberkorns](https://gitea.com/lafriks) <lauris@nix.lv>
+  * [Matti Ranta](https://gitea.com/techknowlogick) <techknowlogick@gitea.io>
+
+* 2019-01-01 ~ 2019-12-31 - https://github.com/go-gitea/gitea/issues/5572
+  * [Lunny Xiao](https://github.com/lunny) <xiaolunwen@gmail.com>
+  * [Lauris Bukšis-Haberkorns](https://github.com/lafriks) <lauris@nix.lv>
+  * [Matti Ranta](https://github.com/techknowlogick) <techknowlogick@gitea.io>
+
+* 2018-01-01 ~ 2018-12-31 - https://github.com/go-gitea/gitea/issues/3255
+  * [Lunny Xiao](https://github.com/lunny) <xiaolunwen@gmail.com>
+  * [Lauris Bukšis-Haberkorns](https://github.com/lafriks) <lauris@nix.lv>
+  * [Kim Carlbäcker](https://github.com/bkcsoft) <kim.carlbacker@gmail.com>
 
 * 2016-11-04 ~ 2017-12-31
   * [Lunny Xiao](https://github.com/lunny) <xiaolunwen@gmail.com>
@@ -240,12 +331,25 @@ in production, please download the latest release tag version. All the
 branches will be protected via GitHub, all the PRs to every branch must
 be reviewed by two maintainers and must pass the automatic tests.
 
+## Releasing Gitea
+
+* Let $vmaj, $vmin and $vpat be Major, Minor and Patch version numbers, $vpat should be rc1, rc2, 0, 1, ...... $vmaj.$vmin will be kept the same as milestones on github or gitea in future.
+* Before releasing, confirm all the version's milestone issues or PRs has been resolved. Then discuss the release on discord channel #maintainers and get agreed with almost all the owners and mergers. Or you can declare the version and if nobody against in about serval hours.
+* If this is a big version first you have to create PR for changelog on branch `master` with PRs with label `changelog` and after it has been merged do following steps:
+  * Create `-dev` tag as `git tag -s -F release.notes v$vmaj.$vmin.0-dev` and push the tag as `git push origin v$vmaj.$vmin.0-dev`.
+  * When CI has finished building tag then you have to create a new branch named `release/v$vmaj.$vmin`
+* If it is bugfix version create PR for changelog on branch `release/v$vmaj.$vmin` and wait till it is reviewed and merged.
+* Add a tag as `git tag -s -F release.notes v$vmaj.$vmin.$`, release.notes file could be a temporary file to only include the changelog this version which you added to `CHANGELOG.md`.
+* And then push the tag as `git push origin v$vmaj.$vmin.$`. Drone CI will automatically created a release and upload all the compiled binary. (But currently it didn't add the release notes automatically. Maybe we should fix that.)
+* If needed send PR for changelog on branch `master`.
+* Send PR to [blog repository](https://gitea.com/gitea/blog) announcing the release.
+
 ## Copyright
 
 Code that you contribute should use the standard copyright header:
 
 ```
-// Copyright 2017 The Gitea Authors. All rights reserved.
+// Copyright 2020 The Gitea Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 ```

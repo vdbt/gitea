@@ -1,6 +1,7 @@
+package mssql
+
 // Transaction Manager requests
 // http://msdn.microsoft.com/en-us/library/dd339887.aspx
-package mssql
 
 import (
 	"encoding/binary"
@@ -16,9 +17,19 @@ const (
 	tmSaveXact      = 9
 )
 
-func sendBeginXact(buf *tdsBuffer, headers []headerStruct, isolation uint8,
-	name string) (err error) {
-	buf.BeginPacket(packTransMgrReq)
+type isoLevel uint8
+
+const (
+	isolationUseCurrent     isoLevel = 0
+	isolationReadUncommited isoLevel = 1
+	isolationReadCommited   isoLevel = 2
+	isolationRepeatableRead isoLevel = 3
+	isolationSerializable   isoLevel = 4
+	isolationSnapshot       isoLevel = 5
+)
+
+func sendBeginXact(buf *tdsBuffer, headers []headerStruct, isolation isoLevel, name string, resetSession bool) (err error) {
+	buf.BeginPacket(packTransMgrReq, resetSession)
 	writeAllHeaders(buf, headers)
 	var rqtype uint16 = tmBeginXact
 	err = binary.Write(buf, binary.LittleEndian, &rqtype)
@@ -40,8 +51,8 @@ const (
 	fBeginXact = 1
 )
 
-func sendCommitXact(buf *tdsBuffer, headers []headerStruct, name string, flags uint8, isolation uint8, newname string) error {
-	buf.BeginPacket(packTransMgrReq)
+func sendCommitXact(buf *tdsBuffer, headers []headerStruct, name string, flags uint8, isolation uint8, newname string, resetSession bool) error {
+	buf.BeginPacket(packTransMgrReq, resetSession)
 	writeAllHeaders(buf, headers)
 	var rqtype uint16 = tmCommitXact
 	err := binary.Write(buf, binary.LittleEndian, &rqtype)
@@ -69,8 +80,8 @@ func sendCommitXact(buf *tdsBuffer, headers []headerStruct, name string, flags u
 	return buf.FinishPacket()
 }
 
-func sendRollbackXact(buf *tdsBuffer, headers []headerStruct, name string, flags uint8, isolation uint8, newname string) error {
-	buf.BeginPacket(packTransMgrReq)
+func sendRollbackXact(buf *tdsBuffer, headers []headerStruct, name string, flags uint8, isolation uint8, newname string, resetSession bool) error {
+	buf.BeginPacket(packTransMgrReq, resetSession)
 	writeAllHeaders(buf, headers)
 	var rqtype uint16 = tmRollbackXact
 	err := binary.Write(buf, binary.LittleEndian, &rqtype)

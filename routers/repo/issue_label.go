@@ -5,11 +5,15 @@
 package repo
 
 import (
+	"net/http"
+
 	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/auth"
 	"code.gitea.io/gitea/modules/base"
 	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/log"
+	"code.gitea.io/gitea/modules/web"
+	"code.gitea.io/gitea/services/forms"
+	issue_service "code.gitea.io/gitea/services/issue"
 )
 
 const (
@@ -21,56 +25,80 @@ func Labels(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("repo.labels")
 	ctx.Data["PageIsIssueList"] = true
 	ctx.Data["PageIsLabels"] = true
-	ctx.Data["RequireMinicolors"] = true
+	ctx.Data["RequireTribute"] = true
 	ctx.Data["LabelTemplates"] = models.LabelTemplates
-	ctx.HTML(200, tplLabels)
+	ctx.HTML(http.StatusOK, tplLabels)
 }
 
 // InitializeLabels init labels for a repository
-func InitializeLabels(ctx *context.Context, form auth.InitializeLabelsForm) {
+func InitializeLabels(ctx *context.Context) {
+	form := web.GetForm(ctx).(*forms.InitializeLabelsForm)
 	if ctx.HasError() {
 		ctx.Redirect(ctx.Repo.RepoLink + "/labels")
 		return
 	}
-	list, err := models.GetLabelTemplateFile(form.TemplateName)
-	if err != nil {
-		ctx.Flash.Error(ctx.Tr("repo.issues.label_templates.fail_to_load_file", form.TemplateName, err))
-		ctx.Redirect(ctx.Repo.RepoLink + "/labels")
-		return
-	}
 
-	labels := make([]*models.Label, len(list))
-	for i := 0; i < len(list); i++ {
-		labels[i] = &models.Label{
-			RepoID: ctx.Repo.Repository.ID,
-			Name:   list[i][0],
-			Color:  list[i][1],
+	if err := models.InitializeLabels(models.DefaultDBContext(), ctx.Repo.Repository.ID, form.TemplateName, false); err != nil {
+		if models.IsErrIssueLabelTemplateLoad(err) {
+			originalErr := err.(models.ErrIssueLabelTemplateLoad).OriginalError
+			ctx.Flash.Error(ctx.Tr("repo.issues.label_templates.fail_to_load_file", form.TemplateName, originalErr))
+			ctx.Redirect(ctx.Repo.RepoLink + "/labels")
+			return
 		}
-	}
-	if err := models.NewLabels(labels...); err != nil {
-		ctx.Handle(500, "NewLabels", err)
+		ctx.ServerError("InitializeLabels", err)
 		return
 	}
 	ctx.Redirect(ctx.Repo.RepoLink + "/labels")
 }
 
-// RetrieveLabels find all the labels of a repository
+// RetrieveLabels find all the labels of a repository and organization
 func RetrieveLabels(ctx *context.Context) {
-	labels, err := models.GetLabelsByRepoID(ctx.Repo.Repository.ID, ctx.Query("sort"))
+	labels, err := models.GetLabelsByRepoID(ctx.Repo.Repository.ID, ctx.Query("sort"), models.ListOptions{})
 	if err != nil {
-		ctx.Handle(500, "RetrieveLabels.GetLabels", err)
+		ctx.ServerError("RetrieveLabels.GetLabels", err)
 		return
 	}
+
 	for _, l := range labels {
 		l.CalOpenIssues()
 	}
+
 	ctx.Data["Labels"] = labels
+
+	if ctx.Repo.Owner.IsOrganization() {
+		orgLabels, err := models.GetLabelsByOrgID(ctx.Repo.Owner.ID, ctx.Query("sort"), models.ListOptions{})
+		if err != nil {
+			ctx.ServerError("GetLabelsByOrgID", err)
+			return
+		}
+		for _, l := range orgLabels {
+			l.CalOpenOrgIssues(ctx.Repo.Repository.ID, l.ID)
+		}
+		ctx.Data["OrgLabels"] = orgLabels
+
+		org, err := models.GetOrgByName(ctx.Repo.Owner.LowerName)
+		if err != nil {
+			ctx.ServerError("GetOrgByName", err)
+			return
+		}
+		if ctx.User != nil {
+			ctx.Org.IsOwner, err = org.IsOwnedBy(ctx.User.ID)
+			if err != nil {
+				ctx.ServerError("org.IsOwnedBy", err)
+				return
+			}
+			ctx.Org.OrgLink = org.OrganisationLink()
+			ctx.Data["IsOrganizationOwner"] = ctx.Org.IsOwner
+			ctx.Data["OrganizationLink"] = ctx.Org.OrgLink
+		}
+	}
 	ctx.Data["NumLabels"] = len(labels)
 	ctx.Data["SortType"] = ctx.Query("sort")
 }
 
 // NewLabel create new label for repository
-func NewLabel(ctx *context.Context, form auth.CreateLabelForm) {
+func NewLabel(ctx *context.Context) {
+	form := web.GetForm(ctx).(*forms.CreateLabelForm)
 	ctx.Data["Title"] = ctx.Tr("repo.labels")
 	ctx.Data["PageIsLabels"] = true
 
@@ -81,34 +109,37 @@ func NewLabel(ctx *context.Context, form auth.CreateLabelForm) {
 	}
 
 	l := &models.Label{
-		RepoID: ctx.Repo.Repository.ID,
-		Name:   form.Title,
-		Color:  form.Color,
+		RepoID:      ctx.Repo.Repository.ID,
+		Name:        form.Title,
+		Description: form.Description,
+		Color:       form.Color,
 	}
 	if err := models.NewLabel(l); err != nil {
-		ctx.Handle(500, "NewLabel", err)
+		ctx.ServerError("NewLabel", err)
 		return
 	}
 	ctx.Redirect(ctx.Repo.RepoLink + "/labels")
 }
 
 // UpdateLabel update a label's name and color
-func UpdateLabel(ctx *context.Context, form auth.CreateLabelForm) {
-	l, err := models.GetLabelByID(form.ID)
+func UpdateLabel(ctx *context.Context) {
+	form := web.GetForm(ctx).(*forms.CreateLabelForm)
+	l, err := models.GetLabelInRepoByID(ctx.Repo.Repository.ID, form.ID)
 	if err != nil {
 		switch {
-		case models.IsErrLabelNotExist(err):
-			ctx.Error(404)
+		case models.IsErrRepoLabelNotExist(err):
+			ctx.Error(http.StatusNotFound)
 		default:
-			ctx.Handle(500, "UpdateLabel", err)
+			ctx.ServerError("UpdateLabel", err)
 		}
 		return
 	}
 
 	l.Name = form.Title
+	l.Description = form.Description
 	l.Color = form.Color
 	if err := models.UpdateLabel(l); err != nil {
-		ctx.Handle(500, "UpdateLabel", err)
+		ctx.ServerError("UpdateLabel", err)
 		return
 	}
 	ctx.Redirect(ctx.Repo.RepoLink + "/labels")
@@ -122,10 +153,9 @@ func DeleteLabel(ctx *context.Context) {
 		ctx.Flash.Success(ctx.Tr("repo.issues.label_deletion_success"))
 	}
 
-	ctx.JSON(200, map[string]interface{}{
+	ctx.JSON(http.StatusOK, map[string]interface{}{
 		"redirect": ctx.Repo.RepoLink + "/labels",
 	})
-	return
 }
 
 // UpdateIssueLabel change issue's labels
@@ -138,59 +168,55 @@ func UpdateIssueLabel(ctx *context.Context) {
 	switch action := ctx.Query("action"); action {
 	case "clear":
 		for _, issue := range issues {
-			if err := issue.ClearLabels(ctx.User); err != nil {
-				ctx.Handle(500, "ClearLabels", err)
+			if err := issue_service.ClearLabels(issue, ctx.User); err != nil {
+				ctx.ServerError("ClearLabels", err)
 				return
 			}
 		}
 	case "attach", "detach", "toggle":
 		label, err := models.GetLabelByID(ctx.QueryInt64("id"))
 		if err != nil {
-			if models.IsErrLabelNotExist(err) {
-				ctx.Error(404, "GetLabelByID")
+			if models.IsErrRepoLabelNotExist(err) {
+				ctx.Error(http.StatusNotFound, "GetLabelByID")
 			} else {
-				ctx.Handle(500, "GetLabelByID", err)
+				ctx.ServerError("GetLabelByID", err)
 			}
 			return
 		}
 
 		if action == "toggle" {
-			anyHaveLabel := false
+			// detach if any issues already have label, otherwise attach
+			action = "attach"
 			for _, issue := range issues {
 				if issue.HasLabel(label.ID) {
-					anyHaveLabel = true
+					action = "detach"
 					break
 				}
-			}
-			if anyHaveLabel {
-				action = "detach"
-			} else {
-				action = "attach"
 			}
 		}
 
 		if action == "attach" {
 			for _, issue := range issues {
-				if err = issue.AddLabel(ctx.User, label); err != nil {
-					ctx.Handle(500, "AddLabel", err)
+				if err = issue_service.AddLabel(issue, ctx.User, label); err != nil {
+					ctx.ServerError("AddLabel", err)
 					return
 				}
 			}
 		} else {
 			for _, issue := range issues {
-				if err = issue.RemoveLabel(ctx.User, label); err != nil {
-					ctx.Handle(500, "RemoveLabel", err)
+				if err = issue_service.RemoveLabel(issue, ctx.User, label); err != nil {
+					ctx.ServerError("RemoveLabel", err)
 					return
 				}
 			}
 		}
 	default:
 		log.Warn("Unrecognized action: %s", action)
-		ctx.Error(500)
+		ctx.Error(http.StatusInternalServerError)
 		return
 	}
 
-	ctx.JSON(200, map[string]interface{}{
+	ctx.JSON(http.StatusOK, map[string]interface{}{
 		"ok": true,
 	})
 }

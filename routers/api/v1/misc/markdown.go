@@ -5,16 +5,22 @@
 package misc
 
 import (
-	api "code.gitea.io/sdk/gitea"
+	"net/http"
+	"strings"
 
 	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/markup"
 	"code.gitea.io/gitea/modules/markup/markdown"
 	"code.gitea.io/gitea/modules/setting"
+	api "code.gitea.io/gitea/modules/structs"
+	"code.gitea.io/gitea/modules/util"
+	"code.gitea.io/gitea/modules/web"
+
+	"mvdan.cc/xurls/v2"
 )
 
 // Markdown render markdown document to HTML
-func Markdown(ctx *context.APIContext, form api.MarkdownOption) {
+func Markdown(ctx *context.APIContext) {
 	// swagger:operation POST /markdown miscellaneous renderMarkdown
 	// ---
 	// summary: Render a markdown document as HTML
@@ -32,27 +38,60 @@ func Markdown(ctx *context.APIContext, form api.MarkdownOption) {
 	//     "$ref": "#/responses/MarkdownRender"
 	//   "422":
 	//     "$ref": "#/responses/validationError"
+
+	form := web.GetForm(ctx).(*api.MarkdownOption)
+
 	if ctx.HasAPIError() {
-		ctx.Error(422, "", ctx.GetErrMsg())
+		ctx.Error(http.StatusUnprocessableEntity, "", ctx.GetErrMsg())
 		return
 	}
 
 	if len(form.Text) == 0 {
-		ctx.Write([]byte(""))
+		_, _ = ctx.Write([]byte(""))
 		return
 	}
 
 	switch form.Mode {
+	case "comment":
+		fallthrough
 	case "gfm":
-		md := []byte(form.Text)
-		context := markup.URLJoin(setting.AppURL, form.Context)
-		if form.Wiki {
-			ctx.Write([]byte(markdown.RenderWiki(md, context, nil)))
-		} else {
-			ctx.Write(markdown.Render(md, context, nil))
+		urlPrefix := form.Context
+		meta := map[string]string{}
+		if !strings.HasPrefix(setting.AppSubURL+"/", urlPrefix) {
+			// check if urlPrefix is already set to a URL
+			linkRegex, _ := xurls.StrictMatchingScheme("https?://")
+			m := linkRegex.FindStringIndex(urlPrefix)
+			if m == nil {
+				urlPrefix = util.URLJoin(setting.AppURL, form.Context)
+			}
+		}
+		if ctx.Repo != nil && ctx.Repo.Repository != nil {
+			// "gfm" = Github Flavored Markdown - set this to render as a document
+			if form.Mode == "gfm" {
+				meta = ctx.Repo.Repository.ComposeDocumentMetas()
+			} else {
+				meta = ctx.Repo.Repository.ComposeMetas()
+			}
+		}
+		if form.Mode == "gfm" {
+			meta["mode"] = "document"
+		}
+
+		if err := markdown.Render(&markup.RenderContext{
+			URLPrefix: urlPrefix,
+			Metas:     meta,
+			IsWiki:    form.Wiki,
+		}, strings.NewReader(form.Text), ctx.Resp); err != nil {
+			ctx.InternalServerError(err)
+			return
 		}
 	default:
-		ctx.Write(markdown.RenderRaw([]byte(form.Text), "", false))
+		if err := markdown.RenderRaw(&markup.RenderContext{
+			URLPrefix: form.Context,
+		}, strings.NewReader(form.Text), ctx.Resp); err != nil {
+			ctx.InternalServerError(err)
+			return
+		}
 	}
 }
 
@@ -62,9 +101,12 @@ func MarkdownRaw(ctx *context.APIContext) {
 	// ---
 	// summary: Render raw markdown as HTML
 	// parameters:
-	// - name: body
-	//   in: body
-	//   type: string
+	//     - name: body
+	//       in: body
+	//       description: Request body to render
+	//       required: true
+	//       schema:
+	//         type: string
 	// consumes:
 	//     - text/plain
 	// produces:
@@ -74,10 +116,9 @@ func MarkdownRaw(ctx *context.APIContext) {
 	//     "$ref": "#/responses/MarkdownRender"
 	//   "422":
 	//     "$ref": "#/responses/validationError"
-	body, err := ctx.Req.Body().Bytes()
-	if err != nil {
-		ctx.Error(422, "", err)
+	defer ctx.Req.Body.Close()
+	if err := markdown.RenderRaw(&markup.RenderContext{}, ctx.Req.Body, ctx.Resp); err != nil {
+		ctx.InternalServerError(err)
 		return
 	}
-	ctx.Write(markdown.RenderRaw(body, "", false))
 }

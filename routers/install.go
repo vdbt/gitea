@@ -5,81 +5,115 @@
 package routers
 
 import (
-	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"strings"
-
-	"github.com/Unknwon/com"
-	"github.com/go-xorm/xorm"
-	"gopkg.in/ini.v1"
+	"time"
 
 	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/auth"
 	"code.gitea.io/gitea/modules/base"
 	"code.gitea.io/gitea/modules/context"
+	"code.gitea.io/gitea/modules/generate"
+	"code.gitea.io/gitea/modules/graceful"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/modules/templates"
+	"code.gitea.io/gitea/modules/translation"
 	"code.gitea.io/gitea/modules/user"
+	"code.gitea.io/gitea/modules/util"
+	"code.gitea.io/gitea/modules/web"
+	"code.gitea.io/gitea/modules/web/middleware"
+	"code.gitea.io/gitea/services/forms"
+
+	"gitea.com/go-chi/session"
+	"gopkg.in/ini.v1"
 )
 
 const (
 	// tplInstall template for installation page
-	tplInstall base.TplName = "install"
+	tplInstall     base.TplName = "install"
+	tplPostInstall base.TplName = "post-install"
 )
 
 // InstallInit prepare for rendering installation page
-func InstallInit(ctx *context.Context) {
-	if setting.InstallLock {
-		ctx.Handle(404, "Install", errors.New("Installation is prohibited"))
-		return
-	}
+func InstallInit(next http.Handler) http.Handler {
+	var rnd = templates.HTMLRenderer()
 
-	ctx.Data["Title"] = ctx.Tr("install.install")
-	ctx.Data["PageIsInstall"] = true
-
-	dbOpts := []string{"MySQL", "PostgreSQL", "MSSQL"}
-	if models.EnableSQLite3 {
-		dbOpts = append(dbOpts, "SQLite3")
-	}
-	if models.EnableTiDB {
-		dbOpts = append(dbOpts, "TiDB")
-	}
-	ctx.Data["DbOptions"] = dbOpts
+	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		if setting.InstallLock {
+			resp.Header().Add("Refresh", "1; url="+setting.AppURL+"user/login")
+			_ = rnd.HTML(resp, 200, string(tplPostInstall), nil)
+			return
+		}
+		var locale = middleware.Locale(resp, req)
+		var startTime = time.Now()
+		var ctx = context.Context{
+			Resp:    context.NewResponse(resp),
+			Flash:   &middleware.Flash{},
+			Locale:  locale,
+			Render:  rnd,
+			Session: session.GetSession(req),
+			Data: map[string]interface{}{
+				"Title":         locale.Tr("install.install"),
+				"PageIsInstall": true,
+				"DbOptions":     setting.SupportedDatabases,
+				"i18n":          locale,
+				"Language":      locale.Language(),
+				"Lang":          locale.Language(),
+				"AllLangs":      translation.AllLangs(),
+				"CurrentURL":    setting.AppSubURL + req.URL.RequestURI(),
+				"PageStartTime": startTime,
+				"TmplLoadTimes": func() string {
+					return time.Since(startTime).String()
+				},
+				"PasswordHashAlgorithms": models.AvailableHashAlgorithms,
+			},
+		}
+		for _, lang := range translation.AllLangs() {
+			if lang.Lang == locale.Language() {
+				ctx.Data["LangName"] = lang.Name
+				break
+			}
+		}
+		ctx.Req = context.WithContext(req, &ctx)
+		next.ServeHTTP(resp, ctx.Req)
+	})
 }
 
 // Install render installation page
 func Install(ctx *context.Context) {
-	form := auth.InstallForm{}
+	form := forms.InstallForm{}
 
 	// Database settings
-	form.DbHost = models.DbCfg.Host
-	form.DbUser = models.DbCfg.User
-	form.DbName = models.DbCfg.Name
-	form.DbPath = models.DbCfg.Path
+	form.DbHost = setting.Database.Host
+	form.DbUser = setting.Database.User
+	form.DbPasswd = setting.Database.Passwd
+	form.DbName = setting.Database.Name
+	form.DbPath = setting.Database.Path
+	form.DbSchema = setting.Database.Schema
+	form.Charset = setting.Database.Charset
 
-	ctx.Data["CurDbOption"] = "MySQL"
-	switch models.DbCfg.Type {
+	var curDBOption = "MySQL"
+	switch setting.Database.Type {
 	case "postgres":
-		ctx.Data["CurDbOption"] = "PostgreSQL"
+		curDBOption = "PostgreSQL"
 	case "mssql":
-		ctx.Data["CurDbOption"] = "MSSQL"
+		curDBOption = "MSSQL"
 	case "sqlite3":
-		if models.EnableSQLite3 {
-			ctx.Data["CurDbOption"] = "SQLite3"
-		}
-	case "tidb":
-		if models.EnableTiDB {
-			ctx.Data["CurDbOption"] = "TiDB"
+		if setting.EnableSQLite3 {
+			curDBOption = "SQLite3"
 		}
 	}
+
+	ctx.Data["CurDbOption"] = curDBOption
 
 	// Application general settings
 	form.AppName = setting.AppName
 	form.RepoRootPath = setting.RepoRootPath
-	form.LFSRootPath = setting.LFS.ContentPath
+	form.LFSRootPath = setting.LFS.Path
 
 	// Note(unknown): it's hard for Windows users change a running user,
 	// 	so just use current one if config says default.
@@ -108,22 +142,25 @@ func Install(ctx *context.Context) {
 	form.OfflineMode = setting.OfflineMode
 	form.DisableGravatar = setting.DisableGravatar
 	form.EnableFederatedAvatar = setting.EnableFederatedAvatar
-	form.EnableOpenIDSignIn = true
-	form.EnableOpenIDSignUp = true
+	form.EnableOpenIDSignIn = setting.Service.EnableOpenIDSignIn
+	form.EnableOpenIDSignUp = setting.Service.EnableOpenIDSignUp
 	form.DisableRegistration = setting.Service.DisableRegistration
+	form.AllowOnlyExternalRegistration = setting.Service.AllowOnlyExternalRegistration
 	form.EnableCaptcha = setting.Service.EnableCaptcha
 	form.RequireSignInView = setting.Service.RequireSignInView
 	form.DefaultKeepEmailPrivate = setting.Service.DefaultKeepEmailPrivate
 	form.DefaultAllowCreateOrganization = setting.Service.DefaultAllowCreateOrganization
 	form.DefaultEnableTimetracking = setting.Service.DefaultEnableTimetracking
 	form.NoReplyAddress = setting.Service.NoReplyAddress
+	form.PasswordAlgorithm = setting.PasswordHashAlgo
 
-	auth.AssignForm(form, ctx.Data)
-	ctx.HTML(200, tplInstall)
+	middleware.AssignForm(form, ctx.Data)
+	ctx.HTML(http.StatusOK, tplInstall)
 }
 
 // InstallPost response for submit install items
-func InstallPost(ctx *context.Context, form auth.InstallForm) {
+func InstallPost(ctx *context.Context) {
+	form := *web.GetForm(ctx).(*forms.InstallForm)
 	var err error
 	ctx.Data["CurDbOption"] = form.DbType
 
@@ -137,7 +174,7 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 			ctx.Data["Err_Admin"] = true
 		}
 
-		ctx.HTML(200, tplInstall)
+		ctx.HTML(http.StatusOK, tplInstall)
 		return
 	}
 
@@ -148,33 +185,31 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 
 	// Pass basic check, now test configuration.
 	// Test database setting.
-	dbTypes := map[string]string{"MySQL": "mysql", "PostgreSQL": "postgres", "MSSQL": "mssql", "SQLite3": "sqlite3", "TiDB": "tidb"}
-	models.DbCfg.Type = dbTypes[form.DbType]
-	models.DbCfg.Host = form.DbHost
-	models.DbCfg.User = form.DbUser
-	models.DbCfg.Passwd = form.DbPasswd
-	models.DbCfg.Name = form.DbName
-	models.DbCfg.SSLMode = form.SSLMode
-	models.DbCfg.Path = form.DbPath
 
-	if (models.DbCfg.Type == "sqlite3" || models.DbCfg.Type == "tidb") &&
-		len(models.DbCfg.Path) == 0 {
+	setting.Database.Type = setting.GetDBTypeByName(form.DbType)
+	setting.Database.Host = form.DbHost
+	setting.Database.User = form.DbUser
+	setting.Database.Passwd = form.DbPasswd
+	setting.Database.Name = form.DbName
+	setting.Database.Schema = form.DbSchema
+	setting.Database.SSLMode = form.SSLMode
+	setting.Database.Charset = form.Charset
+	setting.Database.Path = form.DbPath
+
+	setting.PasswordHashAlgo = form.PasswordAlgorithm
+
+	if (setting.Database.Type == "sqlite3") &&
+		len(setting.Database.Path) == 0 {
 		ctx.Data["Err_DbPath"] = true
 		ctx.RenderWithErr(ctx.Tr("install.err_empty_db_path"), tplInstall, &form)
-		return
-	} else if models.DbCfg.Type == "tidb" &&
-		strings.ContainsAny(path.Base(models.DbCfg.Path), ".-") {
-		ctx.Data["Err_DbPath"] = true
-		ctx.RenderWithErr(ctx.Tr("install.err_invalid_tidb_name"), tplInstall, &form)
 		return
 	}
 
 	// Set test engine.
-	var x *xorm.Engine
-	if err = models.NewTestEngine(x); err != nil {
+	if err = models.NewTestEngine(); err != nil {
 		if strings.Contains(err.Error(), `Unknown database type: sqlite3`) {
 			ctx.Data["Err_DbType"] = true
-			ctx.RenderWithErr(ctx.Tr("install.sqlite3_not_available", "https://docs.gitea.io/installation/install_from_binary.html"), tplInstall, &form)
+			ctx.RenderWithErr(ctx.Tr("install.sqlite3_not_available", "https://docs.gitea.io/en-us/install-from-binary/"), tplInstall, &form)
 		} else {
 			ctx.Data["Err_DbSetting"] = true
 			ctx.RenderWithErr(ctx.Tr("install.invalid_db_setting", err), tplInstall, &form)
@@ -183,7 +218,7 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 	}
 
 	// Test repository root path.
-	form.RepoRootPath = strings.Replace(form.RepoRootPath, "\\", "/", -1)
+	form.RepoRootPath = strings.ReplaceAll(form.RepoRootPath, "\\", "/")
 	if err = os.MkdirAll(form.RepoRootPath, os.ModePerm); err != nil {
 		ctx.Data["Err_RepoRootPath"] = true
 		ctx.RenderWithErr(ctx.Tr("install.invalid_repo_path", err), tplInstall, &form)
@@ -192,7 +227,7 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 
 	// Test LFS root path if not empty, empty meaning disable LFS
 	if form.LFSRootPath != "" {
-		form.LFSRootPath = strings.Replace(form.LFSRootPath, "\\", "/", -1)
+		form.LFSRootPath = strings.ReplaceAll(form.LFSRootPath, "\\", "/")
 		if err := os.MkdirAll(form.LFSRootPath, os.ModePerm); err != nil {
 			ctx.Data["Err_LFSRootPath"] = true
 			ctx.RenderWithErr(ctx.Tr("install.invalid_lfs_path", err), tplInstall, &form)
@@ -201,7 +236,7 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 	}
 
 	// Test log root path.
-	form.LogRootPath = strings.Replace(form.LogRootPath, "\\", "/", -1)
+	form.LogRootPath = strings.ReplaceAll(form.LogRootPath, "\\", "/")
 	if err = os.MkdirAll(form.LogRootPath, os.ModePerm); err != nil {
 		ctx.Data["Err_LogRootPath"] = true
 		ctx.RenderWithErr(ctx.Tr("install.invalid_log_root_path", err), tplInstall, &form)
@@ -223,18 +258,42 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 		return
 	}
 
-	// Check admin password.
-	if len(form.AdminName) > 0 && len(form.AdminPasswd) == 0 {
-		ctx.Data["Err_Admin"] = true
-		ctx.Data["Err_AdminPasswd"] = true
-		ctx.RenderWithErr(ctx.Tr("install.err_empty_admin_password"), tplInstall, form)
-		return
-	}
-	if form.AdminPasswd != form.AdminConfirmPasswd {
-		ctx.Data["Err_Admin"] = true
-		ctx.Data["Err_AdminPasswd"] = true
-		ctx.RenderWithErr(ctx.Tr("form.password_not_match"), tplInstall, form)
-		return
+	// Check admin user creation
+	if len(form.AdminName) > 0 {
+		// Ensure AdminName is valid
+		if err := models.IsUsableUsername(form.AdminName); err != nil {
+			ctx.Data["Err_Admin"] = true
+			ctx.Data["Err_AdminName"] = true
+			if models.IsErrNameReserved(err) {
+				ctx.RenderWithErr(ctx.Tr("install.err_admin_name_is_reserved"), tplInstall, form)
+				return
+			} else if models.IsErrNamePatternNotAllowed(err) {
+				ctx.RenderWithErr(ctx.Tr("install.err_admin_name_pattern_not_allowed"), tplInstall, form)
+				return
+			}
+			ctx.RenderWithErr(ctx.Tr("install.err_admin_name_is_invalid"), tplInstall, form)
+			return
+		}
+		// Check Admin email
+		if len(form.AdminEmail) == 0 {
+			ctx.Data["Err_Admin"] = true
+			ctx.Data["Err_AdminEmail"] = true
+			ctx.RenderWithErr(ctx.Tr("install.err_empty_admin_email"), tplInstall, form)
+			return
+		}
+		// Check admin password.
+		if len(form.AdminPasswd) == 0 {
+			ctx.Data["Err_Admin"] = true
+			ctx.Data["Err_AdminPasswd"] = true
+			ctx.RenderWithErr(ctx.Tr("install.err_empty_admin_password"), tplInstall, form)
+			return
+		}
+		if form.AdminPasswd != form.AdminConfirmPasswd {
+			ctx.Data["Err_Admin"] = true
+			ctx.Data["Err_AdminPasswd"] = true
+			ctx.RenderWithErr(ctx.Tr("form.password_not_match"), tplInstall, form)
+			return
+		}
 	}
 
 	if form.AppURL[len(form.AppURL)-1] != '/' {
@@ -243,19 +302,26 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 
 	// Save settings.
 	cfg := ini.Empty()
-	if com.IsFile(setting.CustomConf) {
+	isFile, err := util.IsFile(setting.CustomConf)
+	if err != nil {
+		log.Error("Unable to check if %s is a file. Error: %v", setting.CustomConf, err)
+	}
+	if isFile {
 		// Keeps custom settings if there is already something.
 		if err = cfg.Append(setting.CustomConf); err != nil {
-			log.Error(4, "Failed to load custom conf '%s': %v", setting.CustomConf, err)
+			log.Error("Failed to load custom conf '%s': %v", setting.CustomConf, err)
 		}
 	}
-	cfg.Section("database").Key("DB_TYPE").SetValue(models.DbCfg.Type)
-	cfg.Section("database").Key("HOST").SetValue(models.DbCfg.Host)
-	cfg.Section("database").Key("NAME").SetValue(models.DbCfg.Name)
-	cfg.Section("database").Key("USER").SetValue(models.DbCfg.User)
-	cfg.Section("database").Key("PASSWD").SetValue(models.DbCfg.Passwd)
-	cfg.Section("database").Key("SSL_MODE").SetValue(models.DbCfg.SSLMode)
-	cfg.Section("database").Key("PATH").SetValue(models.DbCfg.Path)
+	cfg.Section("database").Key("DB_TYPE").SetValue(setting.Database.Type)
+	cfg.Section("database").Key("HOST").SetValue(setting.Database.Host)
+	cfg.Section("database").Key("NAME").SetValue(setting.Database.Name)
+	cfg.Section("database").Key("USER").SetValue(setting.Database.User)
+	cfg.Section("database").Key("PASSWD").SetValue(setting.Database.Passwd)
+	cfg.Section("database").Key("SCHEMA").SetValue(setting.Database.Schema)
+	cfg.Section("database").Key("SSL_MODE").SetValue(setting.Database.SSLMode)
+	cfg.Section("database").Key("CHARSET").SetValue(setting.Database.Charset)
+	cfg.Section("database").Key("PATH").SetValue(setting.Database.Path)
+	cfg.Section("database").Key("LOG_SQL").SetValue("false") // LOG_SQL is rarely helpful
 
 	cfg.Section("").Key("APP_NAME").SetValue(form.AppName)
 	cfg.Section("repository").Key("ROOT").SetValue(form.RepoRootPath)
@@ -269,13 +335,18 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 		cfg.Section("server").Key("DISABLE_SSH").SetValue("true")
 	} else {
 		cfg.Section("server").Key("DISABLE_SSH").SetValue("false")
-		cfg.Section("server").Key("SSH_PORT").SetValue(com.ToStr(form.SSHPort))
+		cfg.Section("server").Key("SSH_PORT").SetValue(fmt.Sprint(form.SSHPort))
 	}
 
 	if form.LFSRootPath != "" {
 		cfg.Section("server").Key("LFS_START_SERVER").SetValue("true")
 		cfg.Section("server").Key("LFS_CONTENT_PATH").SetValue(form.LFSRootPath)
-		cfg.Section("server").Key("LFS_JWT_SECRET").SetValue(base.GetRandomBytesAsBase64(32))
+		var secretKey string
+		if secretKey, err = generate.NewJwtSecret(); err != nil {
+			ctx.RenderWithErr(ctx.Tr("install.lfs_jwt_secret_failed", err), tplInstall, &form)
+			return
+		}
+		cfg.Section("server").Key("LFS_JWT_SECRET").SetValue(secretKey)
 	} else {
 		cfg.Section("server").Key("LFS_START_SERVER").SetValue("false")
 	}
@@ -289,37 +360,42 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 	} else {
 		cfg.Section("mailer").Key("ENABLED").SetValue("false")
 	}
-	cfg.Section("service").Key("REGISTER_EMAIL_CONFIRM").SetValue(com.ToStr(form.RegisterConfirm))
-	cfg.Section("service").Key("ENABLE_NOTIFY_MAIL").SetValue(com.ToStr(form.MailNotify))
+	cfg.Section("service").Key("REGISTER_EMAIL_CONFIRM").SetValue(fmt.Sprint(form.RegisterConfirm))
+	cfg.Section("service").Key("ENABLE_NOTIFY_MAIL").SetValue(fmt.Sprint(form.MailNotify))
 
-	cfg.Section("server").Key("OFFLINE_MODE").SetValue(com.ToStr(form.OfflineMode))
-	cfg.Section("picture").Key("DISABLE_GRAVATAR").SetValue(com.ToStr(form.DisableGravatar))
-	cfg.Section("picture").Key("ENABLE_FEDERATED_AVATAR").SetValue(com.ToStr(form.EnableFederatedAvatar))
-	cfg.Section("openid").Key("ENABLE_OPENID_SIGNIN").SetValue(com.ToStr(form.EnableOpenIDSignIn))
-	cfg.Section("openid").Key("ENABLE_OPENID_SIGNUP").SetValue(com.ToStr(form.EnableOpenIDSignUp))
-	cfg.Section("service").Key("DISABLE_REGISTRATION").SetValue(com.ToStr(form.DisableRegistration))
-	cfg.Section("service").Key("ENABLE_CAPTCHA").SetValue(com.ToStr(form.EnableCaptcha))
-	cfg.Section("service").Key("REQUIRE_SIGNIN_VIEW").SetValue(com.ToStr(form.RequireSignInView))
-	cfg.Section("service").Key("DEFAULT_KEEP_EMAIL_PRIVATE").SetValue(com.ToStr(form.DefaultKeepEmailPrivate))
-	cfg.Section("service").Key("DEFAULT_ALLOW_CREATE_ORGANIZATION").SetValue(com.ToStr(form.DefaultAllowCreateOrganization))
-	cfg.Section("service").Key("DEFAULT_ENABLE_TIMETRACKING").SetValue(com.ToStr(form.DefaultEnableTimetracking))
-	cfg.Section("service").Key("NO_REPLY_ADDRESS").SetValue(com.ToStr(form.NoReplyAddress))
+	cfg.Section("server").Key("OFFLINE_MODE").SetValue(fmt.Sprint(form.OfflineMode))
+	cfg.Section("picture").Key("DISABLE_GRAVATAR").SetValue(fmt.Sprint(form.DisableGravatar))
+	cfg.Section("picture").Key("ENABLE_FEDERATED_AVATAR").SetValue(fmt.Sprint(form.EnableFederatedAvatar))
+	cfg.Section("openid").Key("ENABLE_OPENID_SIGNIN").SetValue(fmt.Sprint(form.EnableOpenIDSignIn))
+	cfg.Section("openid").Key("ENABLE_OPENID_SIGNUP").SetValue(fmt.Sprint(form.EnableOpenIDSignUp))
+	cfg.Section("service").Key("DISABLE_REGISTRATION").SetValue(fmt.Sprint(form.DisableRegistration))
+	cfg.Section("service").Key("ALLOW_ONLY_EXTERNAL_REGISTRATION").SetValue(fmt.Sprint(form.AllowOnlyExternalRegistration))
+	cfg.Section("service").Key("ENABLE_CAPTCHA").SetValue(fmt.Sprint(form.EnableCaptcha))
+	cfg.Section("service").Key("REQUIRE_SIGNIN_VIEW").SetValue(fmt.Sprint(form.RequireSignInView))
+	cfg.Section("service").Key("DEFAULT_KEEP_EMAIL_PRIVATE").SetValue(fmt.Sprint(form.DefaultKeepEmailPrivate))
+	cfg.Section("service").Key("DEFAULT_ALLOW_CREATE_ORGANIZATION").SetValue(fmt.Sprint(form.DefaultAllowCreateOrganization))
+	cfg.Section("service").Key("DEFAULT_ENABLE_TIMETRACKING").SetValue(fmt.Sprint(form.DefaultEnableTimetracking))
+	cfg.Section("service").Key("NO_REPLY_ADDRESS").SetValue(fmt.Sprint(form.NoReplyAddress))
 
 	cfg.Section("").Key("RUN_MODE").SetValue("prod")
 
 	cfg.Section("session").Key("PROVIDER").SetValue("file")
 
-	cfg.Section("log").Key("MODE").SetValue("file")
-	cfg.Section("log").Key("LEVEL").SetValue("Info")
+	cfg.Section("log").Key("MODE").SetValue("console")
+	cfg.Section("log").Key("LEVEL").SetValue(setting.LogLevel.String())
 	cfg.Section("log").Key("ROOT_PATH").SetValue(form.LogRootPath)
+	cfg.Section("log").Key("ROUTER").SetValue("console")
 
 	cfg.Section("security").Key("INSTALL_LOCK").SetValue("true")
 	var secretKey string
-	if secretKey, err = base.GetRandomString(10); err != nil {
+	if secretKey, err = generate.NewSecretKey(); err != nil {
 		ctx.RenderWithErr(ctx.Tr("install.secret_key_failed", err), tplInstall, &form)
 		return
 	}
 	cfg.Section("security").Key("SECRET_KEY").SetValue(secretKey)
+	if len(form.PasswordAlgorithm) > 0 {
+		cfg.Section("security").Key("PASSWORD_HASH_ALGO").SetValue(form.PasswordAlgorithm)
+	}
 
 	err = os.MkdirAll(filepath.Dir(setting.CustomConf), os.ModePerm)
 	if err != nil {
@@ -332,7 +408,8 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 		return
 	}
 
-	GlobalInit()
+	// Re-read settings
+	PostInstallInit(ctx)
 
 	// Create admin account
 	if len(form.AdminName) > 0 {
@@ -355,6 +432,12 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 			u, _ = models.GetUserByName(u.Name)
 		}
 
+		days := 86400 * setting.LogInRememberDays
+		ctx.SetCookie(setting.CookieUserName, u.Name, days)
+
+		ctx.SetSuperSecureCookie(base.EncodeMD5(u.Rands+u.Passwd),
+			setting.CookieRememberName, u.Name, days)
+
 		// Auto-login for admin
 		if err = ctx.Session.Set("uid", u.ID); err != nil {
 			ctx.RenderWithErr(ctx.Tr("install.save_config_failed", err), tplInstall, &form)
@@ -364,9 +447,26 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 			ctx.RenderWithErr(ctx.Tr("install.save_config_failed", err), tplInstall, &form)
 			return
 		}
+
+		if err = ctx.Session.Release(); err != nil {
+			ctx.RenderWithErr(ctx.Tr("install.save_config_failed", err), tplInstall, &form)
+			return
+		}
 	}
 
 	log.Info("First-time run install finished!")
+
 	ctx.Flash.Success(ctx.Tr("install.install_success"))
-	ctx.Redirect(form.AppURL + "user/login")
+
+	ctx.Header().Add("Refresh", "1; url="+setting.AppURL+"user/login")
+	ctx.HTML(http.StatusOK, tplPostInstall)
+
+	// Now get the http.Server from this request and shut it down
+	// NB: This is not our hammerable graceful shutdown this is http.Server.Shutdown
+	srv := ctx.Value(http.ServerContextKey).(*http.Server)
+	go func() {
+		if err := srv.Shutdown(graceful.GetManager().HammerContext()); err != nil {
+			log.Error("Unable to shutdown the install server! Error: %v", err)
+		}
+	}()
 }

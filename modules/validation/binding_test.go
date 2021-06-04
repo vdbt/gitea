@@ -5,14 +5,13 @@
 package validation
 
 import (
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"github.com/go-macaron/binding"
+	"gitea.com/go-chi/binding"
+	"github.com/go-chi/chi"
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/macaron.v1"
 )
 
 const (
@@ -26,31 +25,32 @@ type (
 		expectedErrors binding.Errors
 	}
 
-	handlerFunc func(interface{}, ...interface{}) macaron.Handler
-
-	modeler interface {
-		Model() string
-	}
-
 	TestForm struct {
-		BranchName string `form:"BranchName" binding:"GitRefName"`
-		URL        string `form:"ValidUrl" binding:"ValidUrl"`
+		BranchName  string `form:"BranchName" binding:"GitRefName"`
+		URL         string `form:"ValidUrl" binding:"ValidUrl"`
+		GlobPattern string `form:"GlobPattern" binding:"GlobPattern"`
 	}
 )
 
 func performValidationTest(t *testing.T, testCase validationTestCase) {
 	httpRecorder := httptest.NewRecorder()
-	m := macaron.Classic()
+	m := chi.NewRouter()
 
-	m.Post(testRoute, binding.Validate(testCase.data), func(actual binding.Errors) {
-		assert.Equal(t, fmt.Sprintf("%+v", testCase.expectedErrors), fmt.Sprintf("%+v", actual))
+	m.Post(testRoute, func(resp http.ResponseWriter, req *http.Request) {
+		actual := binding.Validate(req, testCase.data)
+		// see https://github.com/stretchr/testify/issues/435
+		if actual == nil {
+			actual = binding.Errors{}
+		}
+
+		assert.Equal(t, testCase.expectedErrors, actual)
 	})
 
 	req, err := http.NewRequest("POST", testRoute, nil)
 	if err != nil {
 		panic(err)
 	}
-
+	req.Header.Add("Content-Type", "x-www-form-urlencoded")
 	m.ServeHTTP(httpRecorder, req)
 
 	switch httpRecorder.Code {

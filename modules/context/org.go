@@ -1,4 +1,5 @@
 // Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2020 The Gitea Authors.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
@@ -8,18 +9,17 @@ import (
 	"strings"
 
 	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/setting"
-	macaron "gopkg.in/macaron.v1"
 )
 
 // Organization contains organization context
 type Organization struct {
-	IsOwner      bool
-	IsMember     bool
-	IsTeamMember bool // Is member of team.
-	IsTeamAdmin  bool // In owner team or team that has admin permission level.
-	Organization *models.User
-	OrgLink      string
+	IsOwner          bool
+	IsMember         bool
+	IsTeamMember     bool // Is member of team.
+	IsTeamAdmin      bool // In owner team or team that has admin permission level.
+	Organization     *models.User
+	OrgLink          string
+	CanCreateOrgRepo bool
 
 	Team *models.Team
 }
@@ -51,9 +51,16 @@ func HandleOrgAssignment(ctx *Context, args ...bool) {
 	ctx.Org.Organization, err = models.GetUserByName(orgName)
 	if err != nil {
 		if models.IsErrUserNotExist(err) {
-			ctx.Handle(404, "GetUserByName", err)
+			redirectUserID, err := models.LookupUserRedirect(orgName)
+			if err == nil {
+				RedirectToUser(ctx, orgName, redirectUserID)
+			} else if models.IsErrUserRedirectNotExist(err) {
+				ctx.NotFound("GetUserByName", err)
+			} else {
+				ctx.ServerError("LookupUserRedirect", err)
+			}
 		} else {
-			ctx.Handle(500, "GetUserByName", err)
+			ctx.ServerError("GetUserByName", err)
 		}
 		return
 	}
@@ -62,7 +69,7 @@ func HandleOrgAssignment(ctx *Context, args ...bool) {
 
 	// Force redirection when username is actually a user.
 	if !org.IsOrganization() {
-		ctx.Redirect("/" + org.Name)
+		ctx.Redirect(org.HomeLink())
 		return
 	}
 
@@ -72,15 +79,29 @@ func HandleOrgAssignment(ctx *Context, args ...bool) {
 		ctx.Org.IsMember = true
 		ctx.Org.IsTeamMember = true
 		ctx.Org.IsTeamAdmin = true
+		ctx.Org.CanCreateOrgRepo = true
 	} else if ctx.IsSigned {
-		ctx.Org.IsOwner = org.IsOwnedBy(ctx.User.ID)
+		ctx.Org.IsOwner, err = org.IsOwnedBy(ctx.User.ID)
+		if err != nil {
+			ctx.ServerError("IsOwnedBy", err)
+			return
+		}
+
 		if ctx.Org.IsOwner {
 			ctx.Org.IsMember = true
 			ctx.Org.IsTeamMember = true
 			ctx.Org.IsTeamAdmin = true
+			ctx.Org.CanCreateOrgRepo = true
 		} else {
-			if org.IsOrgMember(ctx.User.ID) {
-				ctx.Org.IsMember = true
+			ctx.Org.IsMember, err = org.IsOrgMember(ctx.User.ID)
+			if err != nil {
+				ctx.ServerError("IsOrgMember", err)
+				return
+			}
+			ctx.Org.CanCreateOrgRepo, err = org.CanCreateOrgRepo(ctx.User.ID)
+			if err != nil {
+				ctx.ServerError("CanCreateOrgRepo", err)
+				return
 			}
 		}
 	} else {
@@ -89,26 +110,27 @@ func HandleOrgAssignment(ctx *Context, args ...bool) {
 	}
 	if (requireMember && !ctx.Org.IsMember) ||
 		(requireOwner && !ctx.Org.IsOwner) {
-		ctx.Handle(404, "OrgAssignment", err)
+		ctx.NotFound("OrgAssignment", err)
 		return
 	}
 	ctx.Data["IsOrganizationOwner"] = ctx.Org.IsOwner
 	ctx.Data["IsOrganizationMember"] = ctx.Org.IsMember
+	ctx.Data["CanCreateOrgRepo"] = ctx.Org.CanCreateOrgRepo
 
-	ctx.Org.OrgLink = setting.AppSubURL + "/org/" + org.Name
+	ctx.Org.OrgLink = org.OrganisationLink()
 	ctx.Data["OrgLink"] = ctx.Org.OrgLink
 
 	// Team.
 	if ctx.Org.IsMember {
 		if ctx.Org.IsOwner {
-			if err := org.GetTeams(); err != nil {
-				ctx.Handle(500, "GetTeams", err)
+			if err := org.GetTeams(&models.SearchTeamOptions{}); err != nil {
+				ctx.ServerError("GetTeams", err)
 				return
 			}
 		} else {
 			org.Teams, err = org.GetUserTeams(ctx.User.ID)
 			if err != nil {
-				ctx.Handle(500, "GetUserTeams", err)
+				ctx.ServerError("GetUserTeams", err)
 				return
 			}
 		}
@@ -128,27 +150,27 @@ func HandleOrgAssignment(ctx *Context, args ...bool) {
 		}
 
 		if !teamExists {
-			ctx.Handle(404, "OrgAssignment", err)
+			ctx.NotFound("OrgAssignment", err)
 			return
 		}
 
 		ctx.Data["IsTeamMember"] = ctx.Org.IsTeamMember
 		if requireTeamMember && !ctx.Org.IsTeamMember {
-			ctx.Handle(404, "OrgAssignment", err)
+			ctx.NotFound("OrgAssignment", err)
 			return
 		}
 
 		ctx.Org.IsTeamAdmin = ctx.Org.Team.IsOwnerTeam() || ctx.Org.Team.Authorize >= models.AccessModeAdmin
 		ctx.Data["IsTeamAdmin"] = ctx.Org.IsTeamAdmin
 		if requireTeamAdmin && !ctx.Org.IsTeamAdmin {
-			ctx.Handle(404, "OrgAssignment", err)
+			ctx.NotFound("OrgAssignment", err)
 			return
 		}
 	}
 }
 
-// OrgAssignment returns a macaron middleware to handle organization assignment
-func OrgAssignment(args ...bool) macaron.Handler {
+// OrgAssignment returns a middleware to handle organization assignment
+func OrgAssignment(args ...bool) func(ctx *Context) {
 	return func(ctx *Context) {
 		HandleOrgAssignment(ctx, args...)
 	}

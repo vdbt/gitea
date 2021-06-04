@@ -8,7 +8,6 @@ package httplib
 import (
 	"bytes"
 	"crypto/tls"
-	"encoding/json"
 	"encoding/xml"
 	"io"
 	"io/ioutil"
@@ -23,9 +22,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	jsoniter "github.com/json-iterator/go"
 )
 
-var defaultSetting = Settings{false, "GogsServer", 60 * time.Second, 60 * time.Second, nil, nil, nil, false}
+var defaultSetting = Settings{false, "GiteaServer", 60 * time.Second, 60 * time.Second, nil, nil, nil, false}
 var defaultCookieJar http.CookieJar
 var settingMutex sync.Mutex
 
@@ -164,6 +165,12 @@ func (r *Request) Header(key, value string) *Request {
 	return r
 }
 
+// HeaderWithSensitiveCase add header item in request and keep the case of the header key.
+func (r *Request) HeaderWithSensitiveCase(key, value string) *Request {
+	r.req.Header[key] = []string{value}
+	return r
+}
+
 // Headers returns headers in request.
 func (r *Request) Headers() http.Header {
 	return r.req.Header
@@ -257,7 +264,7 @@ func (r *Request) getResponse() (*http.Response, error) {
 	}
 
 	if r.req.Method == "GET" && len(paramBody) > 0 {
-		if strings.Index(r.url, "?") != -1 {
+		if strings.Contains(r.url, "?") {
 			r.url += "&" + paramBody
 		} else {
 			r.url = r.url + "?" + paramBody
@@ -284,10 +291,13 @@ func (r *Request) getResponse() (*http.Response, error) {
 					}
 				}
 				for k, v := range r.params {
-					bodyWriter.WriteField(k, v)
+					err := bodyWriter.WriteField(k, v)
+					if err != nil {
+						log.Fatal(err)
+					}
 				}
-				bodyWriter.Close()
-				pw.Close()
+				_ = bodyWriter.Close()
+				_ = pw.Close()
 			}()
 			r.Header("Content-Type", bodyWriter.FormDataContentType())
 			r.req.Body = ioutil.NopCloser(pr)
@@ -315,20 +325,17 @@ func (r *Request) getResponse() (*http.Response, error) {
 		trans = &http.Transport{
 			TLSClientConfig: r.setting.TLSClientConfig,
 			Proxy:           proxy,
-			Dial:            TimeoutDialer(r.setting.ConnectTimeout, r.setting.ReadWriteTimeout),
+			Dial:            TimeoutDialer(r.setting.ConnectTimeout),
 		}
-	} else {
-		// if r.transport is *http.Transport then set the settings.
-		if t, ok := trans.(*http.Transport); ok {
-			if t.TLSClientConfig == nil {
-				t.TLSClientConfig = r.setting.TLSClientConfig
-			}
-			if t.Proxy == nil {
-				t.Proxy = r.setting.Proxy
-			}
-			if t.Dial == nil {
-				t.Dial = TimeoutDialer(r.setting.ConnectTimeout, r.setting.ReadWriteTimeout)
-			}
+	} else if t, ok := trans.(*http.Transport); ok {
+		if t.TLSClientConfig == nil {
+			t.TLSClientConfig = r.setting.TLSClientConfig
+		}
+		if t.Proxy == nil {
+			t.Proxy = r.setting.Proxy
+		}
+		if t.Dial == nil {
+			t.Dial = TimeoutDialer(r.setting.ConnectTimeout)
 		}
 	}
 
@@ -345,6 +352,7 @@ func (r *Request) getResponse() (*http.Response, error) {
 	client := &http.Client{
 		Transport: trans,
 		Jar:       jar,
+		Timeout:   r.setting.ReadWriteTimeout,
 	}
 
 	if len(r.setting.UserAgent) > 0 && len(r.req.Header.Get("User-Agent")) == 0 {
@@ -428,6 +436,7 @@ func (r *Request) ToJSON(v interface{}) error {
 	if err != nil {
 		return err
 	}
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	err = json.Unmarshal(data, v)
 	return err
 }
@@ -449,13 +458,12 @@ func (r *Request) Response() (*http.Response, error) {
 }
 
 // TimeoutDialer returns functions of connection dialer with timeout settings for http.Transport Dial field.
-func TimeoutDialer(cTimeout time.Duration, rwTimeout time.Duration) func(net, addr string) (c net.Conn, err error) {
+func TimeoutDialer(cTimeout time.Duration) func(net, addr string) (c net.Conn, err error) {
 	return func(netw, addr string) (net.Conn, error) {
 		conn, err := net.DialTimeout(netw, addr, cTimeout)
 		if err != nil {
 			return nil, err
 		}
-		conn.SetDeadline(time.Now().Add(rwTimeout))
 		return conn, nil
 	}
 }

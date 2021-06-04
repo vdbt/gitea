@@ -5,42 +5,68 @@
 package user
 
 import (
-	api "code.gitea.io/sdk/gitea"
+	"net/http"
 
 	"code.gitea.io/gitea/models"
 	"code.gitea.io/gitea/modules/context"
+	"code.gitea.io/gitea/modules/convert"
 	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/routers/api/v1/convert"
+	api "code.gitea.io/gitea/modules/structs"
+	"code.gitea.io/gitea/modules/web"
 	"code.gitea.io/gitea/routers/api/v1/repo"
+	"code.gitea.io/gitea/routers/api/v1/utils"
 )
 
-// GetUserByParamsName get user by name
-func GetUserByParamsName(ctx *context.APIContext, name string) *models.User {
-	user, err := models.GetUserByName(ctx.Params(name))
-	if err != nil {
-		if models.IsErrUserNotExist(err) {
-			ctx.Status(404)
-		} else {
-			ctx.Error(500, "GetUserByName", err)
-		}
-		return nil
-	}
-	return user
-}
+// appendPrivateInformation appends the owner and key type information to api.PublicKey
+func appendPrivateInformation(apiKey *api.PublicKey, key *models.PublicKey, defaultUser *models.User) (*api.PublicKey, error) {
+	if key.Type == models.KeyTypeDeploy {
+		apiKey.KeyType = "deploy"
+	} else if key.Type == models.KeyTypeUser {
+		apiKey.KeyType = "user"
 
-// GetUserByParams returns user whose name is presented in URL paramenter.
-func GetUserByParams(ctx *context.APIContext) *models.User {
-	return GetUserByParamsName(ctx, ":username")
+		if defaultUser.ID == key.OwnerID {
+			apiKey.Owner = convert.ToUser(defaultUser, defaultUser)
+		} else {
+			user, err := models.GetUserByID(key.OwnerID)
+			if err != nil {
+				return apiKey, err
+			}
+			apiKey.Owner = convert.ToUser(user, user)
+		}
+	} else {
+		apiKey.KeyType = "unknown"
+	}
+	apiKey.ReadOnly = key.Mode == models.AccessModeRead
+	return apiKey, nil
 }
 
 func composePublicKeysAPILink() string {
 	return setting.AppURL + "api/v1/user/keys/"
 }
 
-func listPublicKeys(ctx *context.APIContext, uid int64) {
-	keys, err := models.ListPublicKeys(uid)
+func listPublicKeys(ctx *context.APIContext, user *models.User) {
+	var keys []*models.PublicKey
+	var err error
+
+	fingerprint := ctx.Query("fingerprint")
+	username := ctx.Params("username")
+
+	if fingerprint != "" {
+		// Querying not just listing
+		if username != "" {
+			// Restrict to provided uid
+			keys, err = models.SearchPublicKey(user.ID, fingerprint)
+		} else {
+			// Unrestricted
+			keys, err = models.SearchPublicKey(0, fingerprint)
+		}
+	} else {
+		// Use ListPublicKeys
+		keys, err = models.ListPublicKeys(user.ID, utils.GetListOptions(ctx))
+	}
+
 	if err != nil {
-		ctx.Error(500, "ListPublicKeys", err)
+		ctx.Error(http.StatusInternalServerError, "ListPublicKeys", err)
 		return
 	}
 
@@ -48,9 +74,12 @@ func listPublicKeys(ctx *context.APIContext, uid int64) {
 	apiKeys := make([]*api.PublicKey, len(keys))
 	for i := range keys {
 		apiKeys[i] = convert.ToPublicKey(apiLink, keys[i])
+		if ctx.User.IsAdmin || ctx.User.ID == keys[i].OwnerID {
+			apiKeys[i], _ = appendPrivateInformation(apiKeys[i], keys[i], user)
+		}
 	}
 
-	ctx.JSON(200, &apiKeys)
+	ctx.JSON(http.StatusOK, &apiKeys)
 }
 
 // ListMyPublicKeys list all of the authenticated user's public keys
@@ -58,12 +87,26 @@ func ListMyPublicKeys(ctx *context.APIContext) {
 	// swagger:operation GET /user/keys user userCurrentListKeys
 	// ---
 	// summary: List the authenticated user's public keys
+	// parameters:
+	// - name: fingerprint
+	//   in: query
+	//   description: fingerprint of the key
+	//   type: string
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
 	// produces:
 	// - application/json
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/PublicKeyList"
-	listPublicKeys(ctx, ctx.User.ID)
+
+	listPublicKeys(ctx, ctx.User)
 }
 
 // ListPublicKeys list the given user's public keys
@@ -79,14 +122,27 @@ func ListPublicKeys(ctx *context.APIContext) {
 	//   description: username of user
 	//   type: string
 	//   required: true
+	// - name: fingerprint
+	//   in: query
+	//   description: fingerprint of the key
+	//   type: string
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/PublicKeyList"
+
 	user := GetUserByParams(ctx)
 	if ctx.Written() {
 		return
 	}
-	listPublicKeys(ctx, user.ID)
+	listPublicKeys(ctx, user)
 }
 
 // GetPublicKey get a public key
@@ -101,24 +157,30 @@ func GetPublicKey(ctx *context.APIContext) {
 	//   in: path
 	//   description: id of key to get
 	//   type: integer
+	//   format: int64
 	//   required: true
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/PublicKey"
 	//   "404":
 	//     "$ref": "#/responses/notFound"
+
 	key, err := models.GetPublicKeyByID(ctx.ParamsInt64(":id"))
 	if err != nil {
 		if models.IsErrKeyNotExist(err) {
-			ctx.Status(404)
+			ctx.NotFound()
 		} else {
-			ctx.Error(500, "GetPublicKeyByID", err)
+			ctx.Error(http.StatusInternalServerError, "GetPublicKeyByID", err)
 		}
 		return
 	}
 
 	apiLink := composePublicKeysAPILink()
-	ctx.JSON(200, convert.ToPublicKey(apiLink, key))
+	apiKey := convert.ToPublicKey(apiLink, key)
+	if ctx.User.IsAdmin || ctx.User.ID == key.OwnerID {
+		apiKey, _ = appendPrivateInformation(apiKey, key, ctx.User)
+	}
+	ctx.JSON(http.StatusOK, apiKey)
 }
 
 // CreateUserPublicKey creates new public key to given user by ID.
@@ -129,17 +191,21 @@ func CreateUserPublicKey(ctx *context.APIContext, form api.CreateKeyOption, uid 
 		return
 	}
 
-	key, err := models.AddPublicKey(uid, form.Title, content)
+	key, err := models.AddPublicKey(uid, form.Title, content, 0)
 	if err != nil {
 		repo.HandleAddKeyError(ctx, err)
 		return
 	}
 	apiLink := composePublicKeysAPILink()
-	ctx.JSON(201, convert.ToPublicKey(apiLink, key))
+	apiKey := convert.ToPublicKey(apiLink, key)
+	if ctx.User.IsAdmin || ctx.User.ID == key.OwnerID {
+		apiKey, _ = appendPrivateInformation(apiKey, key, ctx.User)
+	}
+	ctx.JSON(http.StatusCreated, apiKey)
 }
 
 // CreatePublicKey create one public key for me
-func CreatePublicKey(ctx *context.APIContext, form api.CreateKeyOption) {
+func CreatePublicKey(ctx *context.APIContext) {
 	// swagger:operation POST /user/keys user userCurrentPostKey
 	// ---
 	// summary: Create a public key
@@ -157,7 +223,9 @@ func CreatePublicKey(ctx *context.APIContext, form api.CreateKeyOption) {
 	//     "$ref": "#/responses/PublicKey"
 	//   "422":
 	//     "$ref": "#/responses/validationError"
-	CreateUserPublicKey(ctx, form, ctx.User.ID)
+
+	form := web.GetForm(ctx).(*api.CreateKeyOption)
+	CreateUserPublicKey(ctx, *form, ctx.User.ID)
 }
 
 // DeletePublicKey delete one public key
@@ -172,20 +240,35 @@ func DeletePublicKey(ctx *context.APIContext) {
 	//   in: path
 	//   description: id of key to delete
 	//   type: integer
+	//   format: int64
 	//   required: true
 	// responses:
 	//   "204":
 	//     "$ref": "#/responses/empty"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
-	if err := models.DeletePublicKey(ctx.User, ctx.ParamsInt64(":id")); err != nil {
-		if models.IsErrKeyAccessDenied(err) {
-			ctx.Error(403, "", "You do not have access to this key")
+	//   "404":
+	//     "$ref": "#/responses/notFound"
+
+	id := ctx.ParamsInt64(":id")
+	externallyManaged, err := models.PublicKeyIsExternallyManaged(id)
+	if err != nil {
+		ctx.Error(http.StatusInternalServerError, "PublicKeyIsExternallyManaged", err)
+	}
+	if externallyManaged {
+		ctx.Error(http.StatusForbidden, "", "SSH Key is externally managed for this user")
+	}
+
+	if err := models.DeletePublicKey(ctx.User, id); err != nil {
+		if models.IsErrKeyNotExist(err) {
+			ctx.NotFound()
+		} else if models.IsErrKeyAccessDenied(err) {
+			ctx.Error(http.StatusForbidden, "", "You do not have access to this key")
 		} else {
-			ctx.Error(500, "DeletePublicKey", err)
+			ctx.Error(http.StatusInternalServerError, "DeletePublicKey", err)
 		}
 		return
 	}
 
-	ctx.Status(204)
+	ctx.Status(http.StatusNoContent)
 }

@@ -6,44 +6,46 @@ package models
 
 import (
 	"crypto/md5"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"time"
+	"fmt"
 
-	"github.com/Unknwon/com"
-	"github.com/pquerna/otp/totp"
-
-	"code.gitea.io/gitea/modules/base"
+	"code.gitea.io/gitea/modules/secret"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/modules/timeutil"
+	"code.gitea.io/gitea/modules/util"
+
+	"github.com/pquerna/otp/totp"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 // TwoFactor represents a two-factor authentication token.
 type TwoFactor struct {
-	ID           int64 `xorm:"pk autoincr"`
-	UID          int64 `xorm:"UNIQUE"`
-	Secret       string
-	ScratchToken string
-
-	Created     time.Time `xorm:"-"`
-	CreatedUnix int64     `xorm:"INDEX created"`
-	Updated     time.Time `xorm:"-"`
-	UpdatedUnix int64     `xorm:"INDEX updated"`
-}
-
-// AfterLoad is invoked from XORM after setting the values of all fields of this object.
-func (t *TwoFactor) AfterLoad() {
-	t.Created = time.Unix(t.CreatedUnix, 0).Local()
-	t.Updated = time.Unix(t.UpdatedUnix, 0).Local()
+	ID               int64 `xorm:"pk autoincr"`
+	UID              int64 `xorm:"UNIQUE"`
+	Secret           string
+	ScratchSalt      string
+	ScratchHash      string
+	LastUsedPasscode string             `xorm:"VARCHAR(10)"`
+	CreatedUnix      timeutil.TimeStamp `xorm:"INDEX created"`
+	UpdatedUnix      timeutil.TimeStamp `xorm:"INDEX updated"`
 }
 
 // GenerateScratchToken recreates the scratch token the user is using.
-func (t *TwoFactor) GenerateScratchToken() error {
-	token, err := base.GetRandomString(8)
+func (t *TwoFactor) GenerateScratchToken() (string, error) {
+	token, err := util.RandomString(8)
 	if err != nil {
-		return err
+		return "", err
 	}
-	t.ScratchToken = token
-	return nil
+	t.ScratchSalt, _ = util.RandomString(10)
+	t.ScratchHash = hashToken(token, t.ScratchSalt)
+	return token, nil
+}
+
+func hashToken(token, salt string) string {
+	tempHash := pbkdf2.Key([]byte(token), []byte(salt), 10000, 50, sha256.New)
+	return fmt.Sprintf("%x", tempHash)
 }
 
 // VerifyScratchToken verifies if the specified scratch token is valid.
@@ -51,7 +53,8 @@ func (t *TwoFactor) VerifyScratchToken(token string) bool {
 	if len(token) == 0 {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(t.ScratchToken)) == 1
+	tempHash := hashToken(token, t.ScratchSalt)
+	return subtle.ConstantTimeCompare([]byte(t.ScratchHash), []byte(tempHash)) == 1
 }
 
 func (t *TwoFactor) getEncryptionKey() []byte {
@@ -60,8 +63,8 @@ func (t *TwoFactor) getEncryptionKey() []byte {
 }
 
 // SetSecret sets the 2FA secret.
-func (t *TwoFactor) SetSecret(secret string) error {
-	secretBytes, err := com.AESEncrypt(t.getEncryptionKey(), []byte(secret))
+func (t *TwoFactor) SetSecret(secretString string) error {
+	secretBytes, err := secret.AesEncrypt(t.getEncryptionKey(), []byte(secretString))
 	if err != nil {
 		return err
 	}
@@ -75,21 +78,17 @@ func (t *TwoFactor) ValidateTOTP(passcode string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	secret, err := com.AESDecrypt(t.getEncryptionKey(), decodedStoredSecret)
+	secretBytes, err := secret.AesDecrypt(t.getEncryptionKey(), decodedStoredSecret)
 	if err != nil {
 		return false, err
 	}
-	secretStr := string(secret)
+	secretStr := string(secretBytes)
 	return totp.Validate(passcode, secretStr), nil
 }
 
 // NewTwoFactor creates a new two-factor authentication token.
 func NewTwoFactor(t *TwoFactor) error {
-	err := t.GenerateScratchToken()
-	if err != nil {
-		return err
-	}
-	_, err = x.Insert(t)
+	_, err := x.Insert(t)
 	return err
 }
 
@@ -102,8 +101,8 @@ func UpdateTwoFactor(t *TwoFactor) error {
 // GetTwoFactorByUID returns the two-factor authentication token associated with
 // the user, if any.
 func GetTwoFactorByUID(uid int64) (*TwoFactor, error) {
-	twofa := &TwoFactor{UID: uid}
-	has, err := x.Get(twofa)
+	twofa := &TwoFactor{}
+	has, err := x.Where("uid=?", uid).Get(twofa)
 	if err != nil {
 		return nil, err
 	} else if !has {

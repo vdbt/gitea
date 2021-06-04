@@ -5,14 +5,17 @@
 package integrations
 
 import (
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"code.gitea.io/gitea/modules/structs"
 	"github.com/stretchr/testify/assert"
 )
 
-func testRepoMigrate(t testing.TB, session *TestSession, cloneAddr, repoName string) *TestResponse {
-	req := NewRequest(t, "GET", "/repo/migrate")
+func testRepoMigrate(t testing.TB, session *TestSession, cloneAddr, repoName string) *httptest.ResponseRecorder {
+	req := NewRequest(t, "GET", fmt.Sprintf("/repo/migrate?service_type=%d", structs.PlainGitService)) // render plain git migration page
 	resp := session.MakeRequest(t, req, http.StatusOK)
 	htmlDoc := NewHTMLParser(t, resp.Body)
 
@@ -27,41 +30,15 @@ func testRepoMigrate(t testing.TB, session *TestSession, cloneAddr, repoName str
 		"clone_addr": cloneAddr,
 		"uid":        uid,
 		"repo_name":  repoName,
-	},
-	)
+		"service":    fmt.Sprintf("%d", structs.PlainGitService),
+	})
 	resp = session.MakeRequest(t, req, http.StatusFound)
 
 	return resp
 }
 
 func TestRepoMigrate(t *testing.T) {
-	prepareTestEnv(t)
+	defer prepareTestEnv(t)()
 	session := loginUser(t, "user2")
-	testRepoMigrate(t, session, "https://github.com/go-gitea/git.git", "git")
-}
-
-func BenchmarkRepoMigrate(b *testing.B) {
-	samples := []struct {
-		url  string
-		name string
-	}{
-		{url: "https://github.com/go-gitea/gitea.git", name: "gitea"},
-		{url: "https://github.com/ethantkoenig/manyfiles.git", name: "manyfiles"},
-		{url: "https://github.com/moby/moby.git", name: "moby"},
-		{url: "https://github.com/golang/go.git", name: "go"},
-		{url: "https://github.com/torvalds/linux.git", name: "linux"},
-	}
-
-	prepareTestEnv(b)
-	session := loginUser(b, "user2")
-	b.ResetTimer()
-
-	for _, s := range samples {
-		b.Run(s.name, func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				testRepoMigrate(b, session, s.url, s.name)
-			}
-
-		})
-	}
+	testRepoMigrate(t, session, "https://github.com/go-gitea/test_repo.git", "git")
 }

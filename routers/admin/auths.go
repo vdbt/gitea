@@ -5,25 +5,35 @@
 package admin
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
+	"regexp"
 
 	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/auth"
 	"code.gitea.io/gitea/modules/auth/ldap"
 	"code.gitea.io/gitea/modules/auth/oauth2"
+	"code.gitea.io/gitea/modules/auth/pam"
 	"code.gitea.io/gitea/modules/base"
 	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/modules/util"
+	"code.gitea.io/gitea/modules/web"
+	"code.gitea.io/gitea/services/forms"
 
-	"github.com/Unknwon/com"
-	"github.com/go-xorm/core"
+	"xorm.io/xorm/convert"
 )
 
 const (
 	tplAuths    base.TplName = "admin/auth/list"
 	tplAuthNew  base.TplName = "admin/auth/new"
 	tplAuthEdit base.TplName = "admin/auth/edit"
+)
+
+var (
+	separatorAntiPattern = regexp.MustCompile(`[^\w-\.]`)
+	langCodePattern      = regexp.MustCompile(`^[a-z]{2}-[A-Z]{2}$`)
 )
 
 // Authentications show authentication config page
@@ -35,12 +45,12 @@ func Authentications(ctx *context.Context) {
 	var err error
 	ctx.Data["Sources"], err = models.LoginSources()
 	if err != nil {
-		ctx.Handle(500, "LoginSources", err)
+		ctx.ServerError("LoginSources", err)
 		return
 	}
 
 	ctx.Data["Total"] = models.CountLoginSources()
-	ctx.HTML(200, tplAuths)
+	ctx.HTML(http.StatusOK, tplAuths)
 }
 
 type dropdownItem struct {
@@ -49,13 +59,20 @@ type dropdownItem struct {
 }
 
 var (
-	authSources = []dropdownItem{
-		{models.LoginNames[models.LoginLDAP], models.LoginLDAP},
-		{models.LoginNames[models.LoginDLDAP], models.LoginDLDAP},
-		{models.LoginNames[models.LoginSMTP], models.LoginSMTP},
-		{models.LoginNames[models.LoginPAM], models.LoginPAM},
-		{models.LoginNames[models.LoginOAuth2], models.LoginOAuth2},
-	}
+	authSources = func() []dropdownItem {
+		items := []dropdownItem{
+			{models.LoginNames[models.LoginLDAP], models.LoginLDAP},
+			{models.LoginNames[models.LoginDLDAP], models.LoginDLDAP},
+			{models.LoginNames[models.LoginSMTP], models.LoginSMTP},
+			{models.LoginNames[models.LoginOAuth2], models.LoginOAuth2},
+			{models.LoginNames[models.LoginSSPI], models.LoginSSPI},
+		}
+		if pam.Supported {
+			items = append(items, dropdownItem{models.LoginNames[models.LoginPAM], models.LoginPAM})
+		}
+		return items
+	}()
+
 	securityProtocols = []dropdownItem{
 		{models.SecurityProtocolNames[ldap.SecurityProtocolUnencrypted], ldap.SecurityProtocolUnencrypted},
 		{models.SecurityProtocolNames[ldap.SecurityProtocolLDAPS], ldap.SecurityProtocolLDAPS},
@@ -81,40 +98,59 @@ func NewAuthSource(ctx *context.Context) {
 	ctx.Data["OAuth2Providers"] = models.OAuth2Providers
 	ctx.Data["OAuth2DefaultCustomURLMappings"] = models.OAuth2DefaultCustomURLMappings
 
+	ctx.Data["SSPIAutoCreateUsers"] = true
+	ctx.Data["SSPIAutoActivateUsers"] = true
+	ctx.Data["SSPIStripDomainNames"] = true
+	ctx.Data["SSPISeparatorReplacement"] = "_"
+	ctx.Data["SSPIDefaultLanguage"] = ""
+
 	// only the first as default
 	for key := range models.OAuth2Providers {
 		ctx.Data["oauth2_provider"] = key
 		break
 	}
 
-	ctx.HTML(200, tplAuthNew)
+	ctx.HTML(http.StatusOK, tplAuthNew)
 }
 
-func parseLDAPConfig(form auth.AuthenticationForm) *models.LDAPConfig {
+func parseLDAPConfig(form forms.AuthenticationForm) *models.LDAPConfig {
+	var pageSize uint32
+	if form.UsePagedSearch {
+		pageSize = uint32(form.SearchPageSize)
+	}
 	return &models.LDAPConfig{
 		Source: &ldap.Source{
-			Name:              form.Name,
-			Host:              form.Host,
-			Port:              form.Port,
-			SecurityProtocol:  ldap.SecurityProtocol(form.SecurityProtocol),
-			SkipVerify:        form.SkipVerify,
-			BindDN:            form.BindDN,
-			UserDN:            form.UserDN,
-			BindPassword:      form.BindPassword,
-			UserBase:          form.UserBase,
-			AttributeUsername: form.AttributeUsername,
-			AttributeName:     form.AttributeName,
-			AttributeSurname:  form.AttributeSurname,
-			AttributeMail:     form.AttributeMail,
-			AttributesInBind:  form.AttributesInBind,
-			Filter:            form.Filter,
-			AdminFilter:       form.AdminFilter,
-			Enabled:           true,
+			Name:                  form.Name,
+			Host:                  form.Host,
+			Port:                  form.Port,
+			SecurityProtocol:      ldap.SecurityProtocol(form.SecurityProtocol),
+			SkipVerify:            form.SkipVerify,
+			BindDN:                form.BindDN,
+			UserDN:                form.UserDN,
+			BindPassword:          form.BindPassword,
+			UserBase:              form.UserBase,
+			AttributeUsername:     form.AttributeUsername,
+			AttributeName:         form.AttributeName,
+			AttributeSurname:      form.AttributeSurname,
+			AttributeMail:         form.AttributeMail,
+			AttributesInBind:      form.AttributesInBind,
+			AttributeSSHPublicKey: form.AttributeSSHPublicKey,
+			SearchPageSize:        pageSize,
+			Filter:                form.Filter,
+			GroupsEnabled:         form.GroupsEnabled,
+			GroupDN:               form.GroupDN,
+			GroupFilter:           form.GroupFilter,
+			GroupMemberUID:        form.GroupMemberUID,
+			UserUID:               form.UserUID,
+			AdminFilter:           form.AdminFilter,
+			RestrictedFilter:      form.RestrictedFilter,
+			AllowDeactivateAll:    form.AllowDeactivateAll,
+			Enabled:               true,
 		},
 	}
 }
 
-func parseSMTPConfig(form auth.AuthenticationForm) *models.SMTPConfig {
+func parseSMTPConfig(form forms.AuthenticationForm) *models.SMTPConfig {
 	return &models.SMTPConfig{
 		Auth:           form.SMTPAuth,
 		Host:           form.SMTPHost,
@@ -125,7 +161,7 @@ func parseSMTPConfig(form auth.AuthenticationForm) *models.SMTPConfig {
 	}
 }
 
-func parseOAuth2Config(form auth.AuthenticationForm) *models.OAuth2Config {
+func parseOAuth2Config(form forms.AuthenticationForm) *models.OAuth2Config {
 	var customURLMapping *oauth2.CustomURLMapping
 	if form.Oauth2UseCustomURL {
 		customURLMapping = &oauth2.CustomURLMapping{
@@ -143,11 +179,37 @@ func parseOAuth2Config(form auth.AuthenticationForm) *models.OAuth2Config {
 		ClientSecret:                  form.Oauth2Secret,
 		OpenIDConnectAutoDiscoveryURL: form.OpenIDConnectAutoDiscoveryURL,
 		CustomURLMapping:              customURLMapping,
+		IconURL:                       form.Oauth2IconURL,
 	}
 }
 
+func parseSSPIConfig(ctx *context.Context, form forms.AuthenticationForm) (*models.SSPIConfig, error) {
+	if util.IsEmptyString(form.SSPISeparatorReplacement) {
+		ctx.Data["Err_SSPISeparatorReplacement"] = true
+		return nil, errors.New(ctx.Tr("form.SSPISeparatorReplacement") + ctx.Tr("form.require_error"))
+	}
+	if separatorAntiPattern.MatchString(form.SSPISeparatorReplacement) {
+		ctx.Data["Err_SSPISeparatorReplacement"] = true
+		return nil, errors.New(ctx.Tr("form.SSPISeparatorReplacement") + ctx.Tr("form.alpha_dash_dot_error"))
+	}
+
+	if form.SSPIDefaultLanguage != "" && !langCodePattern.MatchString(form.SSPIDefaultLanguage) {
+		ctx.Data["Err_SSPIDefaultLanguage"] = true
+		return nil, errors.New(ctx.Tr("form.lang_select_error"))
+	}
+
+	return &models.SSPIConfig{
+		AutoCreateUsers:      form.SSPIAutoCreateUsers,
+		AutoActivateUsers:    form.SSPIAutoActivateUsers,
+		StripDomainNames:     form.SSPIStripDomainNames,
+		SeparatorReplacement: form.SSPISeparatorReplacement,
+		DefaultLanguage:      form.SSPIDefaultLanguage,
+	}, nil
+}
+
 // NewAuthSourcePost response for adding an auth source
-func NewAuthSourcePost(ctx *context.Context, form auth.AuthenticationForm) {
+func NewAuthSourcePost(ctx *context.Context) {
+	form := *web.GetForm(ctx).(*forms.AuthenticationForm)
 	ctx.Data["Title"] = ctx.Tr("admin.auths.new")
 	ctx.Data["PageIsAdmin"] = true
 	ctx.Data["PageIsAdminAuthentications"] = true
@@ -160,8 +222,14 @@ func NewAuthSourcePost(ctx *context.Context, form auth.AuthenticationForm) {
 	ctx.Data["OAuth2Providers"] = models.OAuth2Providers
 	ctx.Data["OAuth2DefaultCustomURLMappings"] = models.OAuth2DefaultCustomURLMappings
 
+	ctx.Data["SSPIAutoCreateUsers"] = true
+	ctx.Data["SSPIAutoActivateUsers"] = true
+	ctx.Data["SSPIStripDomainNames"] = true
+	ctx.Data["SSPISeparatorReplacement"] = "_"
+	ctx.Data["SSPIDefaultLanguage"] = ""
+
 	hasTLS := false
-	var config core.Conversion
+	var config convert.Conversion
 	switch models.LoginType(form.Type) {
 	case models.LoginLDAP, models.LoginDLDAP:
 		config = parseLDAPConfig(form)
@@ -172,17 +240,31 @@ func NewAuthSourcePost(ctx *context.Context, form auth.AuthenticationForm) {
 	case models.LoginPAM:
 		config = &models.PAMConfig{
 			ServiceName: form.PAMServiceName,
+			EmailDomain: form.PAMEmailDomain,
 		}
 	case models.LoginOAuth2:
 		config = parseOAuth2Config(form)
+	case models.LoginSSPI:
+		var err error
+		config, err = parseSSPIConfig(ctx, form)
+		if err != nil {
+			ctx.RenderWithErr(err.Error(), tplAuthNew, form)
+			return
+		}
+		existing, err := models.LoginSourcesByType(models.LoginSSPI)
+		if err != nil || len(existing) > 0 {
+			ctx.Data["Err_Type"] = true
+			ctx.RenderWithErr(ctx.Tr("admin.auths.login_source_of_type_exist"), tplAuthNew, form)
+			return
+		}
 	default:
-		ctx.Error(400)
+		ctx.Error(http.StatusBadRequest)
 		return
 	}
 	ctx.Data["HasTLS"] = hasTLS
 
 	if ctx.HasError() {
-		ctx.HTML(200, tplAuthNew)
+		ctx.HTML(http.StatusOK, tplAuthNew)
 		return
 	}
 
@@ -197,7 +279,7 @@ func NewAuthSourcePost(ctx *context.Context, form auth.AuthenticationForm) {
 			ctx.Data["Err_Name"] = true
 			ctx.RenderWithErr(ctx.Tr("admin.auths.login_source_exist", err.(models.ErrLoginSourceAlreadyExist).Name), tplAuthNew, form)
 		} else {
-			ctx.Handle(500, "CreateSource", err)
+			ctx.ServerError("CreateSource", err)
 		}
 		return
 	}
@@ -221,7 +303,7 @@ func EditAuthSource(ctx *context.Context) {
 
 	source, err := models.GetLoginSourceByID(ctx.ParamsInt64(":authid"))
 	if err != nil {
-		ctx.Handle(500, "GetLoginSourceByID", err)
+		ctx.ServerError("GetLoginSourceByID", err)
 		return
 	}
 	ctx.Data["Source"] = source
@@ -230,11 +312,12 @@ func EditAuthSource(ctx *context.Context) {
 	if source.IsOAuth2() {
 		ctx.Data["CurrentOAuth2Provider"] = models.OAuth2Providers[source.OAuth2().Provider]
 	}
-	ctx.HTML(200, tplAuthEdit)
+	ctx.HTML(http.StatusOK, tplAuthEdit)
 }
 
 // EditAuthSourcePost response for editing auth source
-func EditAuthSourcePost(ctx *context.Context, form auth.AuthenticationForm) {
+func EditAuthSourcePost(ctx *context.Context) {
+	form := *web.GetForm(ctx).(*forms.AuthenticationForm)
 	ctx.Data["Title"] = ctx.Tr("admin.auths.edit")
 	ctx.Data["PageIsAdmin"] = true
 	ctx.Data["PageIsAdminAuthentications"] = true
@@ -245,18 +328,18 @@ func EditAuthSourcePost(ctx *context.Context, form auth.AuthenticationForm) {
 
 	source, err := models.GetLoginSourceByID(ctx.ParamsInt64(":authid"))
 	if err != nil {
-		ctx.Handle(500, "GetLoginSourceByID", err)
+		ctx.ServerError("GetLoginSourceByID", err)
 		return
 	}
 	ctx.Data["Source"] = source
 	ctx.Data["HasTLS"] = source.HasTLS()
 
 	if ctx.HasError() {
-		ctx.HTML(200, tplAuthEdit)
+		ctx.HTML(http.StatusOK, tplAuthEdit)
 		return
 	}
 
-	var config core.Conversion
+	var config convert.Conversion
 	switch models.LoginType(form.Type) {
 	case models.LoginLDAP, models.LoginDLDAP:
 		config = parseLDAPConfig(form)
@@ -265,11 +348,18 @@ func EditAuthSourcePost(ctx *context.Context, form auth.AuthenticationForm) {
 	case models.LoginPAM:
 		config = &models.PAMConfig{
 			ServiceName: form.PAMServiceName,
+			EmailDomain: form.PAMEmailDomain,
 		}
 	case models.LoginOAuth2:
 		config = parseOAuth2Config(form)
+	case models.LoginSSPI:
+		config, err = parseSSPIConfig(ctx, form)
+		if err != nil {
+			ctx.RenderWithErr(err.Error(), tplAuthEdit, form)
+			return
+		}
 	default:
-		ctx.Error(400)
+		ctx.Error(http.StatusBadRequest)
 		return
 	}
 
@@ -280,23 +370,23 @@ func EditAuthSourcePost(ctx *context.Context, form auth.AuthenticationForm) {
 	if err := models.UpdateSource(source); err != nil {
 		if models.IsErrOpenIDConnectInitialize(err) {
 			ctx.Flash.Error(err.Error(), true)
-			ctx.HTML(200, tplAuthEdit)
+			ctx.HTML(http.StatusOK, tplAuthEdit)
 		} else {
-			ctx.Handle(500, "UpdateSource", err)
+			ctx.ServerError("UpdateSource", err)
 		}
 		return
 	}
 	log.Trace("Authentication changed by admin(%s): %d", ctx.User.Name, source.ID)
 
 	ctx.Flash.Success(ctx.Tr("admin.auths.update_success"))
-	ctx.Redirect(setting.AppSubURL + "/admin/auths/" + com.ToStr(form.ID))
+	ctx.Redirect(setting.AppSubURL + "/admin/auths/" + fmt.Sprint(form.ID))
 }
 
 // DeleteAuthSource response for deleting an auth source
 func DeleteAuthSource(ctx *context.Context) {
 	source, err := models.GetLoginSourceByID(ctx.ParamsInt64(":authid"))
 	if err != nil {
-		ctx.Handle(500, "GetLoginSourceByID", err)
+		ctx.ServerError("GetLoginSourceByID", err)
 		return
 	}
 
@@ -306,7 +396,7 @@ func DeleteAuthSource(ctx *context.Context) {
 		} else {
 			ctx.Flash.Error(fmt.Sprintf("DeleteSource: %v", err))
 		}
-		ctx.JSON(200, map[string]interface{}{
+		ctx.JSON(http.StatusOK, map[string]interface{}{
 			"redirect": setting.AppSubURL + "/admin/auths/" + ctx.Params(":authid"),
 		})
 		return
@@ -314,7 +404,7 @@ func DeleteAuthSource(ctx *context.Context) {
 	log.Trace("Authentication deleted by admin(%s): %d", ctx.User.Name, source.ID)
 
 	ctx.Flash.Success(ctx.Tr("admin.auths.deletion_success"))
-	ctx.JSON(200, map[string]interface{}{
+	ctx.JSON(http.StatusOK, map[string]interface{}{
 		"redirect": setting.AppSubURL + "/admin/auths",
 	})
 }

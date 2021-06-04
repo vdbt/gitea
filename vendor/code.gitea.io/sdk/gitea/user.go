@@ -5,38 +5,42 @@
 package gitea
 
 import (
-	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // User represents a user
-// swagger:model
 type User struct {
 	// the user's id
-	ID        int64  `json:"id"`
+	ID int64 `json:"id"`
 	// the user's username
-	UserName  string `json:"login"`
+	UserName string `json:"login"`
 	// the user's full name
-	FullName  string `json:"full_name"`
-	// swagger:strfmt email
-	Email     string `json:"email"`
+	FullName string `json:"full_name"`
+	Email    string `json:"email"`
 	// URL to the user's avatar
 	AvatarURL string `json:"avatar_url"`
-}
-
-// MarshalJSON implements the json.Marshaler interface for User, adding field(s) for backward compatibility
-func (u User) MarshalJSON() ([]byte, error) {
-	// Re-declaring User to avoid recursion
-	type shadow User
-	return json.Marshal(struct {
-		shadow
-		CompatUserName string `json:"username"`
-	}{shadow(u), u.UserName})
+	// User locale
+	Language string `json:"language"`
+	// Is the user an administrator
+	IsAdmin   bool      `json:"is_admin"`
+	LastLogin time.Time `json:"last_login,omitempty"`
+	Created   time.Time `json:"created,omitempty"`
 }
 
 // GetUserInfo get user info by user's name
-func (c *Client) GetUserInfo(user string) (*User, error) {
+func (c *Client) GetUserInfo(user string) (*User, *Response, error) {
+	if err := escapeValidatePathSegments(&user); err != nil {
+		return nil, nil, err
+	}
 	u := new(User)
-	err := c.getParsedResponse("GET", fmt.Sprintf("/users/%s", user), nil, nil, u)
-	return u, err
+	resp, err := c.getParsedResponse("GET", fmt.Sprintf("/users/%s", user), nil, nil, u)
+	return u, resp, err
+}
+
+// GetMyUserInfo get user info of current user
+func (c *Client) GetMyUserInfo() (*User, *Response, error) {
+	u := new(User)
+	resp, err := c.getParsedResponse("GET", "/user", nil, nil, u)
+	return u, resp, err
 }

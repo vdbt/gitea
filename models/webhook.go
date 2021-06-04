@@ -6,24 +6,19 @@
 package models
 
 import (
-	"crypto/tls"
-	"encoding/json"
+	"context"
 	"fmt"
-	"io/ioutil"
 	"strings"
 	"time"
 
-	"code.gitea.io/gitea/modules/httplib"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/sync"
-	api "code.gitea.io/sdk/gitea"
+	api "code.gitea.io/gitea/modules/structs"
+	"code.gitea.io/gitea/modules/timeutil"
 
-	gouuid "github.com/satori/go.uuid"
+	gouuid "github.com/google/uuid"
+	jsoniter "github.com/json-iterator/go"
 )
-
-// HookQueue is a global queue of web hooks
-var HookQueue = sync.NewUniqueQueue(setting.Webhook.QueueLength)
 
 // HookContentType is the content type of a web hook
 type HookContentType int
@@ -45,6 +40,26 @@ func ToHookContentType(name string) HookContentType {
 	return hookContentTypes[name]
 }
 
+// HookTaskCleanupType is the type of cleanup to perform on hook_task
+type HookTaskCleanupType int
+
+const (
+	// OlderThan hook_task rows will be cleaned up by the age of the row
+	OlderThan HookTaskCleanupType = iota
+	// PerWebhook hook_task rows will be cleaned up by leaving the most recent deliveries for each webhook
+	PerWebhook
+)
+
+var hookTaskCleanupTypes = map[string]HookTaskCleanupType{
+	"OlderThan":  OlderThan,
+	"PerWebhook": PerWebhook,
+}
+
+// ToHookTaskCleanupType returns HookTaskCleanupType by given name.
+func ToHookTaskCleanupType(name string) HookTaskCleanupType {
+	return hookTaskCleanupTypes[name]
+}
+
 // Name returns the name of a given web hook's content type
 func (t HookContentType) Name() string {
 	switch t {
@@ -64,17 +79,32 @@ func IsValidHookContentType(name string) bool {
 
 // HookEvents is a set of web hook events
 type HookEvents struct {
-	Create      bool `json:"create"`
-	Push        bool `json:"push"`
-	PullRequest bool `json:"pull_request"`
-	Repository  bool `json:"repository"`
+	Create               bool `json:"create"`
+	Delete               bool `json:"delete"`
+	Fork                 bool `json:"fork"`
+	Issues               bool `json:"issues"`
+	IssueAssign          bool `json:"issue_assign"`
+	IssueLabel           bool `json:"issue_label"`
+	IssueMilestone       bool `json:"issue_milestone"`
+	IssueComment         bool `json:"issue_comment"`
+	Push                 bool `json:"push"`
+	PullRequest          bool `json:"pull_request"`
+	PullRequestAssign    bool `json:"pull_request_assign"`
+	PullRequestLabel     bool `json:"pull_request_label"`
+	PullRequestMilestone bool `json:"pull_request_milestone"`
+	PullRequestComment   bool `json:"pull_request_comment"`
+	PullRequestReview    bool `json:"pull_request_review"`
+	PullRequestSync      bool `json:"pull_request_sync"`
+	Repository           bool `json:"repository"`
+	Release              bool `json:"release"`
 }
 
 // HookEvent represents events that will delivery hook.
 type HookEvent struct {
-	PushOnly       bool `json:"push_only"`
-	SendEverything bool `json:"send_everything"`
-	ChooseEvents   bool `json:"choose_events"`
+	PushOnly       bool   `json:"push_only"`
+	SendEverything bool   `json:"send_everything"`
+	ChooseEvents   bool   `json:"choose_events"`
+	BranchFilter   string `json:"branch_filter"`
 
 	HookEvents `json:"events"`
 }
@@ -91,53 +121,35 @@ const (
 
 // Webhook represents a web hook object.
 type Webhook struct {
-	ID           int64  `xorm:"pk autoincr"`
-	RepoID       int64  `xorm:"INDEX"`
-	OrgID        int64  `xorm:"INDEX"`
-	URL          string `xorm:"url TEXT"`
-	ContentType  HookContentType
-	Secret       string `xorm:"TEXT"`
-	Events       string `xorm:"TEXT"`
-	*HookEvent   `xorm:"-"`
-	IsSSL        bool `xorm:"is_ssl"`
-	IsActive     bool `xorm:"INDEX"`
-	HookTaskType HookTaskType
-	Meta         string     `xorm:"TEXT"` // store hook-specific attributes
-	LastStatus   HookStatus // Last delivery status
+	ID              int64 `xorm:"pk autoincr"`
+	RepoID          int64 `xorm:"INDEX"` // An ID of 0 indicates either a default or system webhook
+	OrgID           int64 `xorm:"INDEX"`
+	IsSystemWebhook bool
+	URL             string `xorm:"url TEXT"`
+	Signature       string `xorm:"TEXT"`
+	HTTPMethod      string `xorm:"http_method"`
+	ContentType     HookContentType
+	Secret          string `xorm:"TEXT"`
+	Events          string `xorm:"TEXT"`
+	*HookEvent      `xorm:"-"`
+	IsSSL           bool         `xorm:"is_ssl"`
+	IsActive        bool         `xorm:"INDEX"`
+	Type            HookTaskType `xorm:"VARCHAR(16) 'type'"`
+	Meta            string       `xorm:"TEXT"` // store hook-specific attributes
+	LastStatus      HookStatus   // Last delivery status
 
-	Created     time.Time `xorm:"-"`
-	CreatedUnix int64     `xorm:"INDEX created"`
-	Updated     time.Time `xorm:"-"`
-	UpdatedUnix int64     `xorm:"INDEX updated"`
+	CreatedUnix timeutil.TimeStamp `xorm:"INDEX created"`
+	UpdatedUnix timeutil.TimeStamp `xorm:"INDEX updated"`
 }
 
 // AfterLoad updates the webhook object upon setting a column
 func (w *Webhook) AfterLoad() {
 	w.HookEvent = &HookEvent{}
+
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err := json.Unmarshal([]byte(w.Events), w.HookEvent); err != nil {
-		log.Error(3, "Unmarshal[%d]: %v", w.ID, err)
+		log.Error("Unmarshal[%d]: %v", w.ID, err)
 	}
-
-	w.Created = time.Unix(w.CreatedUnix, 0).Local()
-	w.Updated = time.Unix(w.UpdatedUnix, 0).Local()
-}
-
-// GetSlackHook returns slack metadata
-func (w *Webhook) GetSlackHook() *SlackMeta {
-	s := &SlackMeta{}
-	if err := json.Unmarshal([]byte(w.Meta), s); err != nil {
-		log.Error(4, "webhook.GetSlackHook(%d): %v", w.ID, err)
-	}
-	return s
-}
-
-// GetDiscordHook returns discord metadata
-func (w *Webhook) GetDiscordHook() *DiscordMeta {
-	s := &DiscordMeta{}
-	if err := json.Unmarshal([]byte(w.Meta), s); err != nil {
-		log.Error(4, "webhook.GetDiscordHook(%d): %v", w.ID, err)
-	}
-	return s
 }
 
 // History returns history of webhook by given conditions.
@@ -147,6 +159,7 @@ func (w *Webhook) History(page int) ([]*HookTask, error) {
 
 // UpdateEvent handles conversion from HookEvent to Events.
 func (w *Webhook) UpdateEvent() error {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	data, err := json.Marshal(w.HookEvent)
 	w.Events = string(data)
 	return err
@@ -156,6 +169,48 @@ func (w *Webhook) UpdateEvent() error {
 func (w *Webhook) HasCreateEvent() bool {
 	return w.SendEverything ||
 		(w.ChooseEvents && w.HookEvents.Create)
+}
+
+// HasDeleteEvent returns true if hook enabled delete event.
+func (w *Webhook) HasDeleteEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.Delete)
+}
+
+// HasForkEvent returns true if hook enabled fork event.
+func (w *Webhook) HasForkEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.Fork)
+}
+
+// HasIssuesEvent returns true if hook enabled issues event.
+func (w *Webhook) HasIssuesEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.Issues)
+}
+
+// HasIssuesAssignEvent returns true if hook enabled issues assign event.
+func (w *Webhook) HasIssuesAssignEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.IssueAssign)
+}
+
+// HasIssuesLabelEvent returns true if hook enabled issues label event.
+func (w *Webhook) HasIssuesLabelEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.IssueLabel)
+}
+
+// HasIssuesMilestoneEvent returns true if hook enabled issues milestone event.
+func (w *Webhook) HasIssuesMilestoneEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.IssueMilestone)
+}
+
+// HasIssueCommentEvent returns true if hook enabled issue_comment event.
+func (w *Webhook) HasIssueCommentEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.IssueComment)
 }
 
 // HasPushEvent returns true if hook enabled push event.
@@ -170,30 +225,118 @@ func (w *Webhook) HasPullRequestEvent() bool {
 		(w.ChooseEvents && w.HookEvents.PullRequest)
 }
 
+// HasPullRequestAssignEvent returns true if hook enabled pull request assign event.
+func (w *Webhook) HasPullRequestAssignEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.PullRequestAssign)
+}
+
+// HasPullRequestLabelEvent returns true if hook enabled pull request label event.
+func (w *Webhook) HasPullRequestLabelEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.PullRequestLabel)
+}
+
+// HasPullRequestMilestoneEvent returns true if hook enabled pull request milestone event.
+func (w *Webhook) HasPullRequestMilestoneEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.PullRequestMilestone)
+}
+
+// HasPullRequestCommentEvent returns true if hook enabled pull_request_comment event.
+func (w *Webhook) HasPullRequestCommentEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.PullRequestComment)
+}
+
+// HasPullRequestApprovedEvent returns true if hook enabled pull request review event.
+func (w *Webhook) HasPullRequestApprovedEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.PullRequestReview)
+}
+
+// HasPullRequestRejectedEvent returns true if hook enabled pull request review event.
+func (w *Webhook) HasPullRequestRejectedEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.PullRequestReview)
+}
+
+// HasPullRequestReviewCommentEvent returns true if hook enabled pull request review event.
+func (w *Webhook) HasPullRequestReviewCommentEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.PullRequestReview)
+}
+
+// HasPullRequestSyncEvent returns true if hook enabled pull request sync event.
+func (w *Webhook) HasPullRequestSyncEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.PullRequestSync)
+}
+
+// HasReleaseEvent returns if hook enabled release event.
+func (w *Webhook) HasReleaseEvent() bool {
+	return w.SendEverything ||
+		(w.ChooseEvents && w.HookEvents.Release)
+}
+
 // HasRepositoryEvent returns if hook enabled repository event.
 func (w *Webhook) HasRepositoryEvent() bool {
 	return w.SendEverything ||
 		(w.ChooseEvents && w.HookEvents.Repository)
 }
 
+// EventCheckers returns event checkers
+func (w *Webhook) EventCheckers() []struct {
+	Has  func() bool
+	Type HookEventType
+} {
+	return []struct {
+		Has  func() bool
+		Type HookEventType
+	}{
+		{w.HasCreateEvent, HookEventCreate},
+		{w.HasDeleteEvent, HookEventDelete},
+		{w.HasForkEvent, HookEventFork},
+		{w.HasPushEvent, HookEventPush},
+		{w.HasIssuesEvent, HookEventIssues},
+		{w.HasIssuesAssignEvent, HookEventIssueAssign},
+		{w.HasIssuesLabelEvent, HookEventIssueLabel},
+		{w.HasIssuesMilestoneEvent, HookEventIssueMilestone},
+		{w.HasIssueCommentEvent, HookEventIssueComment},
+		{w.HasPullRequestEvent, HookEventPullRequest},
+		{w.HasPullRequestAssignEvent, HookEventPullRequestAssign},
+		{w.HasPullRequestLabelEvent, HookEventPullRequestLabel},
+		{w.HasPullRequestMilestoneEvent, HookEventPullRequestMilestone},
+		{w.HasPullRequestCommentEvent, HookEventPullRequestComment},
+		{w.HasPullRequestApprovedEvent, HookEventPullRequestReviewApproved},
+		{w.HasPullRequestRejectedEvent, HookEventPullRequestReviewRejected},
+		{w.HasPullRequestCommentEvent, HookEventPullRequestReviewComment},
+		{w.HasPullRequestSyncEvent, HookEventPullRequestSync},
+		{w.HasRepositoryEvent, HookEventRepository},
+		{w.HasReleaseEvent, HookEventRelease},
+	}
+}
+
 // EventsArray returns an array of hook events
 func (w *Webhook) EventsArray() []string {
-	events := make([]string, 0, 3)
-	if w.HasCreateEvent() {
-		events = append(events, "create")
-	}
-	if w.HasPushEvent() {
-		events = append(events, "push")
-	}
-	if w.HasPullRequestEvent() {
-		events = append(events, "pull_request")
+	events := make([]string, 0, 7)
+
+	for _, c := range w.EventCheckers() {
+		if c.Has() {
+			events = append(events, string(c.Type))
+		}
 	}
 	return events
 }
 
 // CreateWebhook creates a new web hook.
 func CreateWebhook(w *Webhook) error {
-	_, err := x.Insert(w)
+	return createWebhook(x, w)
+}
+
+func createWebhook(e Engine, w *Webhook) error {
+	w.Type = strings.TrimSpace(w.Type)
+	_, err := e.Insert(w)
 	return err
 }
 
@@ -244,9 +387,16 @@ func getActiveWebhooksByRepoID(e Engine, repoID int64) ([]*Webhook, error) {
 }
 
 // GetWebhooksByRepoID returns all webhooks of a repository.
-func GetWebhooksByRepoID(repoID int64) ([]*Webhook, error) {
-	webhooks := make([]*Webhook, 0, 5)
-	return webhooks, x.Find(&webhooks, &Webhook{RepoID: repoID})
+func GetWebhooksByRepoID(repoID int64, listOptions ListOptions) ([]*Webhook, error) {
+	if listOptions.Page == 0 {
+		webhooks := make([]*Webhook, 0, 5)
+		return webhooks, x.Find(&webhooks, &Webhook{RepoID: repoID})
+	}
+
+	sess := listOptions.getPaginatedSession()
+	webhooks := make([]*Webhook, 0, listOptions.PageSize)
+
+	return webhooks, sess.Find(&webhooks, &Webhook{RepoID: repoID})
 }
 
 // GetActiveWebhooksByOrgID returns all active webhooks for an organization.
@@ -262,10 +412,54 @@ func getActiveWebhooksByOrgID(e Engine, orgID int64) (ws []*Webhook, err error) 
 	return ws, err
 }
 
-// GetWebhooksByOrgID returns all webhooks for an organization.
-func GetWebhooksByOrgID(orgID int64) (ws []*Webhook, err error) {
-	err = x.Find(&ws, &Webhook{OrgID: orgID})
-	return ws, err
+// GetWebhooksByOrgID returns paginated webhooks for an organization.
+func GetWebhooksByOrgID(orgID int64, listOptions ListOptions) ([]*Webhook, error) {
+	if listOptions.Page == 0 {
+		ws := make([]*Webhook, 0, 5)
+		return ws, x.Find(&ws, &Webhook{OrgID: orgID})
+	}
+
+	sess := listOptions.getPaginatedSession()
+	ws := make([]*Webhook, 0, listOptions.PageSize)
+	return ws, sess.Find(&ws, &Webhook{OrgID: orgID})
+}
+
+// GetDefaultWebhooks returns all admin-default webhooks.
+func GetDefaultWebhooks() ([]*Webhook, error) {
+	return getDefaultWebhooks(x)
+}
+
+func getDefaultWebhooks(e Engine) ([]*Webhook, error) {
+	webhooks := make([]*Webhook, 0, 5)
+	return webhooks, e.
+		Where("repo_id=? AND org_id=? AND is_system_webhook=?", 0, 0, false).
+		Find(&webhooks)
+}
+
+// GetSystemOrDefaultWebhook returns admin system or default webhook by given ID.
+func GetSystemOrDefaultWebhook(id int64) (*Webhook, error) {
+	webhook := &Webhook{ID: id}
+	has, err := x.
+		Where("repo_id=? AND org_id=?", 0, 0).
+		Get(webhook)
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, ErrWebhookNotExist{id}
+	}
+	return webhook, nil
+}
+
+// GetSystemWebhooks returns all admin system webhooks.
+func GetSystemWebhooks() ([]*Webhook, error) {
+	return getSystemWebhooks(x)
+}
+
+func getSystemWebhooks(e Engine) ([]*Webhook, error) {
+	webhooks := make([]*Webhook, 0, 5)
+	return webhooks, e.
+		Where("repo_id=? AND org_id=? AND is_system_webhook=?", 0, 0, true).
+		Find(&webhooks)
 }
 
 // UpdateWebhook updates information of webhook.
@@ -316,6 +510,47 @@ func DeleteWebhookByOrgID(orgID, id int64) error {
 	})
 }
 
+// DeleteDefaultSystemWebhook deletes an admin-configured default or system webhook (where Org and Repo ID both 0)
+func DeleteDefaultSystemWebhook(id int64) error {
+	sess := x.NewSession()
+	defer sess.Close()
+	if err := sess.Begin(); err != nil {
+		return err
+	}
+
+	count, err := sess.
+		Where("repo_id=? AND org_id=?", 0, 0).
+		Delete(&Webhook{ID: id})
+	if err != nil {
+		return err
+	} else if count == 0 {
+		return ErrWebhookNotExist{ID: id}
+	}
+
+	if _, err := sess.Delete(&HookTask{HookID: id}); err != nil {
+		return err
+	}
+
+	return sess.Commit()
+}
+
+// copyDefaultWebhooksToRepo creates copies of the default webhooks in a new repo
+func copyDefaultWebhooksToRepo(e Engine, repoID int64) error {
+	ws, err := getDefaultWebhooks(e)
+	if err != nil {
+		return fmt.Errorf("GetDefaultWebhooks: %v", err)
+	}
+
+	for _, w := range ws {
+		w.ID = 0
+		w.RepoID = repoID
+		if err := createWebhook(e, w); err != nil {
+			return fmt.Errorf("CreateWebhook: %v", err)
+		}
+	}
+	return nil
+}
+
 //   ___ ___                __   ___________              __
 //  /   |   \  ____   ____ |  | _\__    ___/____    _____|  | __
 // /    ~    \/  _ \ /  _ \|  |/ / |    |  \__  \  /  ___/  |/ /
@@ -324,63 +559,79 @@ func DeleteWebhookByOrgID(orgID, id int64) error {
 //        \/                    \/              \/     \/     \/
 
 // HookTaskType is the type of an hook task
-type HookTaskType int
+type HookTaskType = string
 
 // Types of hook tasks
 const (
-	GOGS HookTaskType = iota + 1
-	SLACK
-	GITEA
-	DISCORD
-	DINGTALK
+	GITEA    HookTaskType = "gitea"
+	GOGS     HookTaskType = "gogs"
+	SLACK    HookTaskType = "slack"
+	DISCORD  HookTaskType = "discord"
+	DINGTALK HookTaskType = "dingtalk"
+	TELEGRAM HookTaskType = "telegram"
+	MSTEAMS  HookTaskType = "msteams"
+	FEISHU   HookTaskType = "feishu"
+	MATRIX   HookTaskType = "matrix"
 )
-
-var hookTaskTypes = map[string]HookTaskType{
-	"gitea":    GITEA,
-	"gogs":     GOGS,
-	"slack":    SLACK,
-	"discord":  DISCORD,
-	"dingtalk": DINGTALK,
-}
-
-// ToHookTaskType returns HookTaskType by given name.
-func ToHookTaskType(name string) HookTaskType {
-	return hookTaskTypes[name]
-}
-
-// Name returns the name of an hook task type
-func (t HookTaskType) Name() string {
-	switch t {
-	case GITEA:
-		return "gitea"
-	case GOGS:
-		return "gogs"
-	case SLACK:
-		return "slack"
-	case DISCORD:
-		return "discord"
-	case DINGTALK:
-		return "dingtalk"
-	}
-	return ""
-}
-
-// IsValidHookTaskType returns true if given name is a valid hook task type.
-func IsValidHookTaskType(name string) bool {
-	_, ok := hookTaskTypes[name]
-	return ok
-}
 
 // HookEventType is the type of an hook event
 type HookEventType string
 
 // Types of hook events
 const (
-	HookEventCreate      HookEventType = "create"
-	HookEventPush        HookEventType = "push"
-	HookEventPullRequest HookEventType = "pull_request"
-	HookEventRepository  HookEventType = "repository"
+	HookEventCreate                    HookEventType = "create"
+	HookEventDelete                    HookEventType = "delete"
+	HookEventFork                      HookEventType = "fork"
+	HookEventPush                      HookEventType = "push"
+	HookEventIssues                    HookEventType = "issues"
+	HookEventIssueAssign               HookEventType = "issue_assign"
+	HookEventIssueLabel                HookEventType = "issue_label"
+	HookEventIssueMilestone            HookEventType = "issue_milestone"
+	HookEventIssueComment              HookEventType = "issue_comment"
+	HookEventPullRequest               HookEventType = "pull_request"
+	HookEventPullRequestAssign         HookEventType = "pull_request_assign"
+	HookEventPullRequestLabel          HookEventType = "pull_request_label"
+	HookEventPullRequestMilestone      HookEventType = "pull_request_milestone"
+	HookEventPullRequestComment        HookEventType = "pull_request_comment"
+	HookEventPullRequestReviewApproved HookEventType = "pull_request_review_approved"
+	HookEventPullRequestReviewRejected HookEventType = "pull_request_review_rejected"
+	HookEventPullRequestReviewComment  HookEventType = "pull_request_review_comment"
+	HookEventPullRequestSync           HookEventType = "pull_request_sync"
+	HookEventRepository                HookEventType = "repository"
+	HookEventRelease                   HookEventType = "release"
 )
+
+// Event returns the HookEventType as an event string
+func (h HookEventType) Event() string {
+	switch h {
+	case HookEventCreate:
+		return "create"
+	case HookEventDelete:
+		return "delete"
+	case HookEventFork:
+		return "fork"
+	case HookEventPush:
+		return "push"
+	case HookEventIssues, HookEventIssueAssign, HookEventIssueLabel, HookEventIssueMilestone:
+		return "issues"
+	case HookEventPullRequest, HookEventPullRequestAssign, HookEventPullRequestLabel, HookEventPullRequestMilestone,
+		HookEventPullRequestSync:
+		return "pull_request"
+	case HookEventIssueComment, HookEventPullRequestComment:
+		return "issue_comment"
+	case HookEventPullRequestReviewApproved:
+		return "pull_request_approved"
+	case HookEventPullRequestReviewRejected:
+		return "pull_request_rejected"
+	case HookEventPullRequestReviewComment:
+		return "pull_request_comment"
+	case HookEventRepository:
+		return "repository"
+	case HookEventRelease:
+		return "release"
+	}
+	return ""
+}
 
 // HookRequest represents hook task request information.
 type HookRequest struct {
@@ -400,10 +651,12 @@ type HookTask struct {
 	RepoID          int64 `xorm:"INDEX"`
 	HookID          int64
 	UUID            string
-	Type            HookTaskType
-	URL             string `xorm:"TEXT"`
+	Typ             HookTaskType `xorm:"VARCHAR(16) index"`
+	URL             string       `xorm:"TEXT"`
+	Signature       string       `xorm:"TEXT"`
 	api.Payloader   `xorm:"-"`
 	PayloadContent  string `xorm:"TEXT"`
+	HTTPMethod      string `xorm:"http_method"`
 	ContentType     HookContentType
 	EventType       HookEventType
 	IsSSL           bool
@@ -439,15 +692,24 @@ func (t *HookTask) AfterLoad() {
 	}
 
 	t.RequestInfo = &HookRequest{}
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err := json.Unmarshal([]byte(t.RequestContent), t.RequestInfo); err != nil {
-		log.Error(3, "Unmarshal[%d]: %v", t.ID, err)
+		log.Error("Unmarshal RequestContent[%d]: %v", t.ID, err)
+	}
+
+	if len(t.ResponseContent) > 0 {
+		t.ResponseInfo = &HookResponse{}
+		if err := json.Unmarshal([]byte(t.ResponseContent), t.ResponseInfo); err != nil {
+			log.Error("Unmarshal ResponseContent[%d]: %v", t.ID, err)
+		}
 	}
 }
 
 func (t *HookTask) simpleMarshalJSON(v interface{}) string {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	p, err := json.Marshal(v)
 	if err != nil {
-		log.Error(3, "Marshal [%d]: %v", t.ID, err)
+		log.Error("Marshal [%d]: %v", t.ID, err)
 	}
 	return string(p)
 }
@@ -473,7 +735,7 @@ func createHookTask(e Engine, t *HookTask) error {
 	if err != nil {
 		return err
 	}
-	t.UUID = gouuid.NewV4().String()
+	t.UUID = gouuid.New().String()
 	t.PayloadContent = string(data)
 	_, err = e.Insert(t)
 	return err
@@ -485,222 +747,86 @@ func UpdateHookTask(t *HookTask) error {
 	return err
 }
 
-// PrepareWebhook adds special webhook to task queue for given payload.
-func PrepareWebhook(w *Webhook, repo *Repository, event HookEventType, p api.Payloader) error {
-	return prepareWebhook(x, w, repo, event, p)
+// FindUndeliveredHookTasks represents find the undelivered hook tasks
+func FindUndeliveredHookTasks() ([]*HookTask, error) {
+	tasks := make([]*HookTask, 0, 10)
+	if err := x.Where("is_delivered=?", false).Find(&tasks); err != nil {
+		return nil, err
+	}
+	return tasks, nil
 }
 
-func prepareWebhook(e Engine, w *Webhook, repo *Repository, event HookEventType, p api.Payloader) error {
-	switch event {
-	case HookEventCreate:
-		if !w.HasCreateEvent() {
-			return nil
-		}
-	case HookEventPush:
-		if !w.HasPushEvent() {
-			return nil
-		}
-	case HookEventPullRequest:
-		if !w.HasPullRequestEvent() {
-			return nil
-		}
-	case HookEventRepository:
-		if !w.HasRepositoryEvent() {
-			return nil
-		}
+// FindRepoUndeliveredHookTasks represents find the undelivered hook tasks of one repository
+func FindRepoUndeliveredHookTasks(repoID int64) ([]*HookTask, error) {
+	tasks := make([]*HookTask, 0, 5)
+	if err := x.Where("repo_id=? AND is_delivered=?", repoID, false).Find(&tasks); err != nil {
+		return nil, err
 	}
-
-	var payloader api.Payloader
-	var err error
-	// Use separate objects so modifications won't be made on payload on non-Gogs/Gitea type hooks.
-	switch w.HookTaskType {
-	case SLACK:
-		payloader, err = GetSlackPayload(p, event, w.Meta)
-		if err != nil {
-			return fmt.Errorf("GetSlackPayload: %v", err)
-		}
-	case DISCORD:
-		payloader, err = GetDiscordPayload(p, event, w.Meta)
-		if err != nil {
-			return fmt.Errorf("GetDiscordPayload: %v", err)
-		}
-	case DINGTALK:
-		payloader, err = GetDingtalkPayload(p, event, w.Meta)
-		if err != nil {
-			return fmt.Errorf("GetDingtalkPayload: %v", err)
-		}
-	default:
-		p.SetSecret(w.Secret)
-		payloader = p
-	}
-
-	if err = createHookTask(e, &HookTask{
-		RepoID:      repo.ID,
-		HookID:      w.ID,
-		Type:        w.HookTaskType,
-		URL:         w.URL,
-		Payloader:   payloader,
-		ContentType: w.ContentType,
-		EventType:   event,
-		IsSSL:       w.IsSSL,
-	}); err != nil {
-		return fmt.Errorf("CreateHookTask: %v", err)
-	}
-	return nil
+	return tasks, nil
 }
 
-// PrepareWebhooks adds new webhooks to task queue for given payload.
-func PrepareWebhooks(repo *Repository, event HookEventType, p api.Payloader) error {
-	return prepareWebhooks(x, repo, event, p)
-}
+// CleanupHookTaskTable deletes rows from hook_task as needed.
+func CleanupHookTaskTable(ctx context.Context, cleanupType HookTaskCleanupType, olderThan time.Duration, numberToKeep int) error {
+	log.Trace("Doing: CleanupHookTaskTable")
 
-func prepareWebhooks(e Engine, repo *Repository, event HookEventType, p api.Payloader) error {
-	ws, err := getActiveWebhooksByRepoID(e, repo.ID)
-	if err != nil {
-		return fmt.Errorf("GetActiveWebhooksByRepoID: %v", err)
-	}
-
-	// check if repo belongs to org and append additional webhooks
-	if repo.mustOwner(e).IsOrganization() {
-		// get hooks for org
-		orgHooks, err := getActiveWebhooksByOrgID(e, repo.OwnerID)
+	if cleanupType == OlderThan {
+		deleteOlderThan := time.Now().Add(-olderThan).UnixNano()
+		deletes, err := x.
+			Where("is_delivered = ? and delivered < ?", true, deleteOlderThan).
+			Delete(new(HookTask))
 		if err != nil {
-			return fmt.Errorf("GetActiveWebhooksByOrgID: %v", err)
-		}
-		ws = append(ws, orgHooks...)
-	}
-
-	if len(ws) == 0 {
-		return nil
-	}
-
-	for _, w := range ws {
-		if err = prepareWebhook(e, w, repo, event, p); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func (t *HookTask) deliver() {
-	t.IsDelivered = true
-
-	timeout := time.Duration(setting.Webhook.DeliverTimeout) * time.Second
-	req := httplib.Post(t.URL).SetTimeout(timeout, timeout).
-		Header("X-Gitea-Delivery", t.UUID).
-		Header("X-Gitea-Event", string(t.EventType)).
-		Header("X-Gogs-Delivery", t.UUID).
-		Header("X-Gogs-Event", string(t.EventType)).
-		Header("X-GitHub-Delivery", t.UUID).
-		Header("X-GitHub-Event", string(t.EventType)).
-		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: setting.Webhook.SkipTLSVerify})
-
-	switch t.ContentType {
-	case ContentTypeJSON:
-		req = req.Header("Content-Type", "application/json").Body(t.PayloadContent)
-	case ContentTypeForm:
-		req.Param("payload", t.PayloadContent)
-	}
-
-	// Record delivery information.
-	t.RequestInfo = &HookRequest{
-		Headers: map[string]string{},
-	}
-	for k, vals := range req.Headers() {
-		t.RequestInfo.Headers[k] = strings.Join(vals, ",")
-	}
-
-	t.ResponseInfo = &HookResponse{
-		Headers: map[string]string{},
-	}
-
-	defer func() {
-		t.Delivered = time.Now().UnixNano()
-		if t.IsSucceed {
-			log.Trace("Hook delivered: %s", t.UUID)
-		} else {
-			log.Trace("Hook delivery failed: %s", t.UUID)
-		}
-
-		// Update webhook last delivery status.
-		w, err := GetWebhookByID(t.HookID)
+		log.Trace("Deleted %d rows from hook_task", deletes)
+	} else if cleanupType == PerWebhook {
+		hookIDs := make([]int64, 0, 10)
+		err := x.Table("webhook").
+			Where("id > 0").
+			Cols("id").
+			Find(&hookIDs)
 		if err != nil {
-			log.Error(5, "GetWebhookByID: %v", err)
-			return
+			return err
 		}
-		if t.IsSucceed {
-			w.LastStatus = HookStatusSucceed
-		} else {
-			w.LastStatus = HookStatusFail
-		}
-		if err = UpdateWebhookLastStatus(w); err != nil {
-			log.Error(5, "UpdateWebhookLastStatus: %v", err)
-			return
-		}
-	}()
-
-	resp, err := req.Response()
-	if err != nil {
-		t.ResponseInfo.Body = fmt.Sprintf("Delivery: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Status code is 20x can be seen as succeed.
-	t.IsSucceed = resp.StatusCode/100 == 2
-	t.ResponseInfo.Status = resp.StatusCode
-	for k, vals := range resp.Header {
-		t.ResponseInfo.Headers[k] = strings.Join(vals, ",")
-	}
-
-	p, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.ResponseInfo.Body = fmt.Sprintf("read body: %s", err)
-		return
-	}
-	t.ResponseInfo.Body = string(p)
-}
-
-// DeliverHooks checks and delivers undelivered hooks.
-// TODO: shoot more hooks at same time.
-func DeliverHooks() {
-	tasks := make([]*HookTask, 0, 10)
-	err := x.Where("is_delivered=?", false).Find(&tasks)
-	if err != nil {
-		log.Error(4, "DeliverHooks: %v", err)
-		return
-	}
-
-	// Update hook task status.
-	for _, t := range tasks {
-		t.deliver()
-
-		if err := UpdateHookTask(t); err != nil {
-			log.Error(4, "UpdateHookTask [%d]: %v", t.ID, err)
-		}
-	}
-
-	// Start listening on new hook requests.
-	for repoID := range HookQueue.Queue() {
-		log.Trace("DeliverHooks [repo_id: %v]", repoID)
-		HookQueue.Remove(repoID)
-
-		tasks = make([]*HookTask, 0, 5)
-		if err := x.Where("repo_id=? AND is_delivered=?", repoID, false).Find(&tasks); err != nil {
-			log.Error(4, "Get repository [%s] hook tasks: %v", repoID, err)
-			continue
-		}
-		for _, t := range tasks {
-			t.deliver()
-			if err := UpdateHookTask(t); err != nil {
-				log.Error(4, "UpdateHookTask [%d]: %v", t.ID, err)
-				continue
+		for _, hookID := range hookIDs {
+			select {
+			case <-ctx.Done():
+				return ErrCancelledf("Before deleting hook_task records for hook id %d", hookID)
+			default:
+			}
+			if err = deleteDeliveredHookTasksByWebhook(hookID, numberToKeep); err != nil {
+				return err
 			}
 		}
 	}
+	log.Trace("Finished: CleanupHookTaskTable")
+	return nil
 }
 
-// InitDeliverHooks starts the hooks delivery thread
-func InitDeliverHooks() {
-	go DeliverHooks()
+func deleteDeliveredHookTasksByWebhook(hookID int64, numberDeliveriesToKeep int) error {
+	log.Trace("Deleting hook_task rows for webhook %d, keeping the most recent %d deliveries", hookID, numberDeliveriesToKeep)
+	deliveryDates := make([]int64, 0, 10)
+	err := x.Table("hook_task").
+		Where("hook_task.hook_id = ? AND hook_task.is_delivered = ? AND hook_task.delivered is not null", hookID, true).
+		Cols("hook_task.delivered").
+		Join("INNER", "webhook", "hook_task.hook_id = webhook.id").
+		OrderBy("hook_task.delivered desc").
+		Limit(1, int(numberDeliveriesToKeep)).
+		Find(&deliveryDates)
+	if err != nil {
+		return err
+	}
+
+	if len(deliveryDates) > 0 {
+		deletes, err := x.
+			Where("hook_id = ? and is_delivered = ? and delivered <= ?", hookID, true, deliveryDates[0]).
+			Delete(new(HookTask))
+		if err != nil {
+			return err
+		}
+		log.Trace("Deleted %d hook_task rows for webhook %d", deletes, hookID)
+	} else {
+		log.Trace("No hook_task rows to delete for webhook %d", hookID)
+	}
+
+	return nil
 }

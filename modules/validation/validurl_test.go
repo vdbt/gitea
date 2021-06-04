@@ -7,7 +7,7 @@ package validation
 import (
 	"testing"
 
-	"github.com/go-macaron/binding"
+	"gitea.com/go-chi/binding"
 )
 
 var urlValidationTestCases = []validationTestCase{

@@ -13,18 +13,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestToWikiPageURL(t *testing.T) {
-	assert.Equal(t, "wiki-name", ToWikiPageURL("wiki-name"))
-	assert.Equal(t, "wiki-name-with-many-spaces", ToWikiPageURL("wiki name with many spaces"))
-}
-
-func TestToWikiPageName(t *testing.T) {
-	assert.Equal(t, "wiki name", ToWikiPageName("wiki name"))
-	assert.Equal(t, "wiki name", ToWikiPageName("wiki-name"))
-	assert.Equal(t, "wiki name", ToWikiPageName("wiki\tname"))
-	assert.Equal(t, "wiki name", ToWikiPageName("./.././wiki/name"))
-}
-
 func TestRepository_WikiCloneLink(t *testing.T) {
 	assert.NoError(t, PrepareTestDatabase())
 
@@ -47,17 +35,10 @@ func TestRepository_WikiPath(t *testing.T) {
 	assert.Equal(t, expected, repo.WikiPath())
 }
 
-// TODO TestRepository_HasWiki
-
-// TODO TestRepository_InitWiki
-
-func TestRepository_LocalWikiPath(t *testing.T) {
-	assert.NoError(t, PrepareTestDatabase())
-	repo := AssertExistsAndLoadBean(t, &Repository{ID: 1}).(*Repository)
-	expected := filepath.Join(setting.AppDataPath, "tmp/local-wiki/1")
-	assert.Equal(t, expected, repo.LocalWikiPath())
+func TestRepository_HasWiki(t *testing.T) {
+	PrepareTestEnv(t)
+	repo1 := AssertExistsAndLoadBean(t, &Repository{ID: 1}).(*Repository)
+	assert.True(t, repo1.HasWiki())
+	repo2 := AssertExistsAndLoadBean(t, &Repository{ID: 2}).(*Repository)
+	assert.False(t, repo2.HasWiki())
 }
-
-// TODO TestRepository_UpdateLocalWiki
-
-// TODO ... (all remaining untested functions)

@@ -5,35 +5,36 @@
 package models
 
 import (
-	"encoding/json"
-	"time"
+	"fmt"
 
-	"github.com/Unknwon/com"
-	"github.com/go-xorm/core"
-	"github.com/go-xorm/xorm"
+	"code.gitea.io/gitea/modules/timeutil"
+
+	jsoniter "github.com/json-iterator/go"
+	"xorm.io/xorm"
+	"xorm.io/xorm/convert"
 )
 
 // RepoUnit describes all units of a repository
 type RepoUnit struct {
 	ID          int64
-	RepoID      int64           `xorm:"INDEX(s)"`
-	Type        UnitType        `xorm:"INDEX(s)"`
-	Config      core.Conversion `xorm:"TEXT"`
-	CreatedUnix int64           `xorm:"INDEX CREATED"`
-	Created     time.Time       `xorm:"-"`
+	RepoID      int64              `xorm:"INDEX(s)"`
+	Type        UnitType           `xorm:"INDEX(s)"`
+	Config      convert.Conversion `xorm:"TEXT"`
+	CreatedUnix timeutil.TimeStamp `xorm:"INDEX CREATED"`
 }
 
 // UnitConfig describes common unit config
-type UnitConfig struct {
-}
+type UnitConfig struct{}
 
 // FromDB fills up a UnitConfig from serialized format.
 func (cfg *UnitConfig) FromDB(bs []byte) error {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	return json.Unmarshal(bs, &cfg)
 }
 
 // ToDB exports a UnitConfig to a serialized format.
 func (cfg *UnitConfig) ToDB() ([]byte, error) {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	return json.Marshal(cfg)
 }
 
@@ -44,11 +45,13 @@ type ExternalWikiConfig struct {
 
 // FromDB fills up a ExternalWikiConfig from serialized format.
 func (cfg *ExternalWikiConfig) FromDB(bs []byte) error {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	return json.Unmarshal(bs, &cfg)
 }
 
 // ToDB exports a ExternalWikiConfig to a serialized format.
 func (cfg *ExternalWikiConfig) ToDB() ([]byte, error) {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	return json.Marshal(cfg)
 }
 
@@ -61,11 +64,13 @@ type ExternalTrackerConfig struct {
 
 // FromDB fills up a ExternalTrackerConfig from serialized format.
 func (cfg *ExternalTrackerConfig) FromDB(bs []byte) error {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	return json.Unmarshal(bs, &cfg)
 }
 
 // ToDB exports a ExternalTrackerConfig to a serialized format.
 func (cfg *ExternalTrackerConfig) ToDB() ([]byte, error) {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	return json.Marshal(cfg)
 }
 
@@ -73,16 +78,79 @@ func (cfg *ExternalTrackerConfig) ToDB() ([]byte, error) {
 type IssuesConfig struct {
 	EnableTimetracker                bool
 	AllowOnlyContributorsToTrackTime bool
+	EnableDependencies               bool
 }
 
 // FromDB fills up a IssuesConfig from serialized format.
 func (cfg *IssuesConfig) FromDB(bs []byte) error {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	return json.Unmarshal(bs, &cfg)
 }
 
 // ToDB exports a IssuesConfig to a serialized format.
 func (cfg *IssuesConfig) ToDB() ([]byte, error) {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	return json.Marshal(cfg)
+}
+
+// PullRequestsConfig describes pull requests config
+type PullRequestsConfig struct {
+	IgnoreWhitespaceConflicts bool
+	AllowMerge                bool
+	AllowRebase               bool
+	AllowRebaseMerge          bool
+	AllowSquash               bool
+	AllowManualMerge          bool
+	AutodetectManualMerge     bool
+	DefaultMergeStyle         MergeStyle
+}
+
+// FromDB fills up a PullRequestsConfig from serialized format.
+func (cfg *PullRequestsConfig) FromDB(bs []byte) error {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
+	return json.Unmarshal(bs, &cfg)
+}
+
+// ToDB exports a PullRequestsConfig to a serialized format.
+func (cfg *PullRequestsConfig) ToDB() ([]byte, error) {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
+	return json.Marshal(cfg)
+}
+
+// IsMergeStyleAllowed returns if merge style is allowed
+func (cfg *PullRequestsConfig) IsMergeStyleAllowed(mergeStyle MergeStyle) bool {
+	return mergeStyle == MergeStyleMerge && cfg.AllowMerge ||
+		mergeStyle == MergeStyleRebase && cfg.AllowRebase ||
+		mergeStyle == MergeStyleRebaseMerge && cfg.AllowRebaseMerge ||
+		mergeStyle == MergeStyleSquash && cfg.AllowSquash ||
+		mergeStyle == MergeStyleManuallyMerged && cfg.AllowManualMerge
+}
+
+// GetDefaultMergeStyle returns the default merge style for this pull request
+func (cfg *PullRequestsConfig) GetDefaultMergeStyle() MergeStyle {
+	if len(cfg.DefaultMergeStyle) != 0 {
+		return cfg.DefaultMergeStyle
+	}
+
+	return MergeStyleMerge
+}
+
+// AllowedMergeStyleCount returns the total count of allowed merge styles for the PullRequestsConfig
+func (cfg *PullRequestsConfig) AllowedMergeStyleCount() int {
+	count := 0
+	if cfg.AllowMerge {
+		count++
+	}
+	if cfg.AllowRebase {
+		count++
+	}
+	if cfg.AllowRebaseMerge {
+		count++
+	}
+	if cfg.AllowSquash {
+		count++
+	}
+	return count
 }
 
 // BeforeSet is invoked from XORM before setting the value of a field of this object.
@@ -90,24 +158,20 @@ func (r *RepoUnit) BeforeSet(colName string, val xorm.Cell) {
 	switch colName {
 	case "type":
 		switch UnitType(Cell2Int64(val)) {
-		case UnitTypeCode, UnitTypePullRequests, UnitTypeReleases,
-			UnitTypeWiki:
+		case UnitTypeCode, UnitTypeReleases, UnitTypeWiki, UnitTypeProjects:
 			r.Config = new(UnitConfig)
 		case UnitTypeExternalWiki:
 			r.Config = new(ExternalWikiConfig)
 		case UnitTypeExternalTracker:
 			r.Config = new(ExternalTrackerConfig)
+		case UnitTypePullRequests:
+			r.Config = new(PullRequestsConfig)
 		case UnitTypeIssues:
 			r.Config = new(IssuesConfig)
 		default:
-			panic("unrecognized repo unit type: " + com.ToStr(*val))
+			panic(fmt.Sprintf("unrecognized repo unit type: %v", *val))
 		}
 	}
-}
-
-// AfterLoad is invoked from XORM after setting the values of all fields of this object.
-func (r *RepoUnit) AfterLoad() {
-	r.Created = time.Unix(r.CreatedUnix, 0).Local()
 }
 
 // Unit returns Unit
@@ -121,8 +185,8 @@ func (r *RepoUnit) CodeConfig() *UnitConfig {
 }
 
 // PullRequestsConfig returns config for UnitTypePullRequests
-func (r *RepoUnit) PullRequestsConfig() *UnitConfig {
-	return r.Config.(*UnitConfig)
+func (r *RepoUnit) PullRequestsConfig() *PullRequestsConfig {
+	return r.Config.(*PullRequestsConfig)
 }
 
 // ReleasesConfig returns config for UnitTypeReleases
@@ -146,9 +210,16 @@ func (r *RepoUnit) ExternalTrackerConfig() *ExternalTrackerConfig {
 }
 
 func getUnitsByRepoID(e Engine, repoID int64) (units []*RepoUnit, err error) {
-	return units, e.Where("repo_id = ?", repoID).Find(&units)
-}
+	var tmpUnits []*RepoUnit
+	if err := e.Where("repo_id = ?", repoID).Find(&tmpUnits); err != nil {
+		return nil, err
+	}
 
-func getUnitsByRepoIDAndIDs(e Engine, repoID int64, types []UnitType) (units []*RepoUnit, err error) {
-	return units, e.Where("repo_id = ?", repoID).In("`type`", types).Find(&units)
+	for _, u := range tmpUnits {
+		if !u.Type.UnitGlobalDisabled() {
+			units = append(units, u)
+		}
+	}
+
+	return units, nil
 }

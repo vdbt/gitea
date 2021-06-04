@@ -7,119 +7,55 @@
 package templates
 
 import (
-	"bytes"
-	"fmt"
 	"html/template"
-	"io"
 	"io/ioutil"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
+	texttmpl "text/template"
 
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
-	"github.com/Unknwon/com"
-	"gopkg.in/macaron.v1"
+	"code.gitea.io/gitea/modules/util"
 )
 
 var (
-	templates = template.New("")
+	subjectTemplates = texttmpl.New("")
+	bodyTemplates    = template.New("")
 )
 
-type templateFileSystem struct {
-	files []macaron.TemplateFile
-}
-
-func (templates templateFileSystem) ListFiles() []macaron.TemplateFile {
-	return templates.files
-}
-
-func (templates templateFileSystem) Get(name string) (io.Reader, error) {
-	for i := range templates.files {
-		if templates.files[i].Name()+templates.files[i].Ext() == name {
-			return bytes.NewReader(templates.files[i].Data()), nil
-		}
+// GetAsset get a special asset, only for chi
+func GetAsset(name string) ([]byte, error) {
+	bs, err := ioutil.ReadFile(filepath.Join(setting.CustomPath, name))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	} else if err == nil {
+		return bs, nil
 	}
-
-	return nil, fmt.Errorf("file '%s' not found", name)
+	return Asset(strings.TrimPrefix(name, "templates/"))
 }
 
-// Renderer implements the macaron handler for serving the templates.
-func Renderer() macaron.Handler {
-	fs := templateFileSystem{}
-	fs.files = make([]macaron.TemplateFile, 0, 10)
-
-	for _, assetPath := range AssetNames() {
-		if strings.HasPrefix(assetPath, "mail/") {
-			continue
-		}
-
-		if !strings.HasSuffix(assetPath, ".tmpl") {
-			continue
-		}
-
-		content, err := Asset(assetPath)
-
-		if err != nil {
-			log.Warn("Failed to read embedded %s template. %v", assetPath, err)
-			continue
-		}
-
-		fs.files = append(fs.files, macaron.NewTplFile(
-			strings.TrimSuffix(
-				assetPath,
-				".tmpl",
-			),
-			content,
-			".tmpl",
-		))
+// GetAssetNames only for chi
+func GetAssetNames() []string {
+	realFS := Assets.(vfsgen۰FS)
+	var tmpls = make([]string, 0, len(realFS))
+	for k := range realFS {
+		tmpls = append(tmpls, "templates/"+k[1:])
 	}
 
 	customDir := path.Join(setting.CustomPath, "templates")
-
-	if com.IsDir(customDir) {
-		files, err := com.StatDir(customDir)
-
-		if err != nil {
-			log.Warn("Failed to read %s templates dir. %v", customDir, err)
-		} else {
-			for _, filePath := range files {
-				if strings.HasPrefix(filePath, "mail/") {
-					continue
-				}
-
-				if !strings.HasSuffix(filePath, ".tmpl") {
-					continue
-				}
-
-				content, err := ioutil.ReadFile(path.Join(customDir, filePath))
-
-				if err != nil {
-					log.Warn("Failed to read custom %s template. %v", filePath, err)
-					continue
-				}
-
-				fs.files = append(fs.files, macaron.NewTplFile(
-					strings.TrimSuffix(
-						filePath,
-						".tmpl",
-					),
-					content,
-					".tmpl",
-				))
-			}
-		}
-	}
-
-	return macaron.Renderer(macaron.RenderOptions{
-		Funcs:              NewFuncMap(),
-		TemplateFileSystem: fs,
-	})
+	customTmpls := getDirAssetNames(customDir)
+	return append(tmpls, customTmpls...)
 }
 
 // Mailer provides the templates required for sending notification mails.
-func Mailer() *template.Template {
+func Mailer() (*texttmpl.Template, *template.Template) {
+	for _, funcs := range NewTextFuncMap() {
+		subjectTemplates.Funcs(funcs)
+	}
 	for _, funcs := range NewFuncMap() {
-		templates.Funcs(funcs)
+		bodyTemplates.Funcs(funcs)
 	}
 
 	for _, assetPath := range AssetNames() {
@@ -138,7 +74,8 @@ func Mailer() *template.Template {
 			continue
 		}
 
-		templates.New(
+		buildSubjectBodyTemplate(subjectTemplates,
+			bodyTemplates,
 			strings.TrimPrefix(
 				strings.TrimSuffix(
 					assetPath,
@@ -146,13 +83,16 @@ func Mailer() *template.Template {
 				),
 				"mail/",
 			),
-		).Parse(string(content))
+			content)
 	}
 
 	customDir := path.Join(setting.CustomPath, "templates", "mail")
-
-	if com.IsDir(customDir) {
-		files, err := com.StatDir(customDir)
+	isDir, err := util.IsDir(customDir)
+	if err != nil {
+		log.Warn("Failed to check if custom directory %s is a directory. %v", err)
+	}
+	if isDir {
+		files, err := util.StatDir(customDir)
 
 		if err != nil {
 			log.Warn("Failed to read %s templates dir. %v", customDir, err)
@@ -169,15 +109,47 @@ func Mailer() *template.Template {
 					continue
 				}
 
-				templates.New(
+				buildSubjectBodyTemplate(subjectTemplates,
+					bodyTemplates,
 					strings.TrimSuffix(
 						filePath,
 						".tmpl",
 					),
-				).Parse(string(content))
+					content)
 			}
 		}
 	}
 
-	return templates
+	return subjectTemplates, bodyTemplates
+}
+
+func Asset(name string) ([]byte, error) {
+	f, err := Assets.Open("/" + name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return ioutil.ReadAll(f)
+}
+
+func AssetNames() []string {
+	realFS := Assets.(vfsgen۰FS)
+	var results = make([]string, 0, len(realFS))
+	for k := range realFS {
+		results = append(results, k[1:])
+	}
+	return results
+}
+
+func AssetIsDir(name string) (bool, error) {
+	if f, err := Assets.Open("/" + name); err != nil {
+		return false, err
+	} else {
+		defer f.Close()
+		if fi, err := f.Stat(); err != nil {
+			return false, err
+		} else {
+			return fi.IsDir(), nil
+		}
+	}
 }

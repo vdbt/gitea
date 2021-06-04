@@ -1,4 +1,5 @@
 // Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2020 The Gitea Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
@@ -6,47 +7,45 @@ package models
 
 import (
 	"fmt"
-	"time"
 
 	"code.gitea.io/gitea/modules/log"
+	"code.gitea.io/gitea/modules/storage"
+	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/modules/util"
-
-	"github.com/Unknwon/com"
 )
 
-//NoticeType describes the notice type
+// NoticeType describes the notice type
 type NoticeType int
 
 const (
-	//NoticeRepository type
+	// NoticeRepository type
 	NoticeRepository NoticeType = iota + 1
+	// NoticeTask type
+	NoticeTask
 )
 
 // Notice represents a system notice for admin.
 type Notice struct {
 	ID          int64 `xorm:"pk autoincr"`
 	Type        NoticeType
-	Description string    `xorm:"TEXT"`
-	Created     time.Time `xorm:"-"`
-	CreatedUnix int64     `xorm:"INDEX created"`
-}
-
-// AfterLoad is invoked from XORM after setting the values of all fields of this object.
-func (n *Notice) AfterLoad() {
-	n.Created = time.Unix(n.CreatedUnix, 0).Local()
+	Description string             `xorm:"TEXT"`
+	CreatedUnix timeutil.TimeStamp `xorm:"INDEX created"`
 }
 
 // TrStr returns a translation format string.
 func (n *Notice) TrStr() string {
-	return "admin.notices.type_" + com.ToStr(n.Type)
+	return fmt.Sprintf("admin.notices.type_%d", n.Type)
 }
 
 // CreateNotice creates new system notice.
-func CreateNotice(tp NoticeType, desc string) error {
-	return createNotice(x, tp, desc)
+func CreateNotice(tp NoticeType, desc string, args ...interface{}) error {
+	return createNotice(x, tp, desc, args...)
 }
 
-func createNotice(e Engine, tp NoticeType, desc string) error {
+func createNotice(e Engine, tp NoticeType, desc string, args ...interface{}) error {
+	if len(args) > 0 {
+		desc = fmt.Sprintf(desc, args...)
+	}
 	n := &Notice{
 		Type:        tp,
 		Description: desc,
@@ -56,8 +55,8 @@ func createNotice(e Engine, tp NoticeType, desc string) error {
 }
 
 // CreateRepositoryNotice creates new system notice with type NoticeRepository.
-func CreateRepositoryNotice(desc string) error {
-	return createNotice(x, NoticeRepository, desc)
+func CreateRepositoryNotice(desc string, args ...interface{}) error {
+	return createNotice(x, NoticeRepository, desc, args...)
 }
 
 // RemoveAllWithNotice removes all directories in given path and
@@ -66,12 +65,28 @@ func RemoveAllWithNotice(title, path string) {
 	removeAllWithNotice(x, title, path)
 }
 
+// RemoveStorageWithNotice removes a file from the storage and
+// creates a system notice when error occurs.
+func RemoveStorageWithNotice(bucket storage.ObjectStorage, title, path string) {
+	removeStorageWithNotice(x, bucket, title, path)
+}
+
+func removeStorageWithNotice(e Engine, bucket storage.ObjectStorage, title, path string) {
+	if err := bucket.Delete(path); err != nil {
+		desc := fmt.Sprintf("%s [%s]: %v", title, path, err)
+		log.Warn(title+" [%s]: %v", path, err)
+		if err = createNotice(e, NoticeRepository, desc); err != nil {
+			log.Error("CreateRepositoryNotice: %v", err)
+		}
+	}
+}
+
 func removeAllWithNotice(e Engine, title, path string) {
 	if err := util.RemoveAll(path); err != nil {
 		desc := fmt.Sprintf("%s [%s]: %v", title, path, err)
-		log.Warn(desc)
+		log.Warn(title+" [%s]: %v", path, err)
 		if err = createNotice(e, NoticeRepository, desc); err != nil {
-			log.Error(4, "CreateRepositoryNotice: %v", err)
+			log.Error("CreateRepositoryNotice: %v", err)
 		}
 	}
 }
@@ -99,6 +114,11 @@ func DeleteNotice(id int64) error {
 
 // DeleteNotices deletes all notices with ID from start to end (inclusive).
 func DeleteNotices(start, end int64) error {
+	if start == 0 && end == 0 {
+		_, err := x.Exec("DELETE FROM notice")
+		return err
+	}
+
 	sess := x.Where("id >= ?", start)
 	if end > 0 {
 		sess.And("id <= ?", end)
@@ -116,4 +136,17 @@ func DeleteNoticesByIDs(ids []int64) error {
 		In("id", ids).
 		Delete(new(Notice))
 	return err
+}
+
+// GetAdminUser returns the first administrator
+func GetAdminUser() (*User, error) {
+	var admin User
+	has, err := x.Where("is_admin=?", true).Get(&admin)
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, ErrUserNotExist{}
+	}
+
+	return &admin, nil
 }

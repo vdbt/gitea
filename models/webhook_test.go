@@ -5,11 +5,13 @@
 package models
 
 import (
-	"encoding/json"
+	"context"
 	"testing"
+	"time"
 
-	api "code.gitea.io/sdk/gitea"
+	api "code.gitea.io/gitea/modules/structs"
 
+	jsoniter "github.com/json-iterator/go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -22,18 +24,6 @@ func TestIsValidHookContentType(t *testing.T) {
 	assert.True(t, IsValidHookContentType("json"))
 	assert.True(t, IsValidHookContentType("form"))
 	assert.False(t, IsValidHookContentType("invalid"))
-}
-
-func TestWebhook_GetSlackHook(t *testing.T) {
-	w := &Webhook{
-		Meta: `{"channel": "foo", "username": "username", "color": "blue"}`,
-	}
-	slackHook := w.GetSlackHook()
-	assert.Equal(t, *slackHook, SlackMeta{
-		Channel:  "foo",
-		Username: "username",
-		Color:    "blue",
-	})
 }
 
 func TestWebhook_History(t *testing.T) {
@@ -68,12 +58,19 @@ func TestWebhook_UpdateEvent(t *testing.T) {
 	assert.NoError(t, webhook.UpdateEvent())
 	assert.NotEmpty(t, webhook.Events)
 	actualHookEvent := &HookEvent{}
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	assert.NoError(t, json.Unmarshal([]byte(webhook.Events), actualHookEvent))
 	assert.Equal(t, *hookEvent, *actualHookEvent)
 }
 
 func TestWebhook_EventsArray(t *testing.T) {
-	assert.Equal(t, []string{"create", "push", "pull_request"},
+	assert.Equal(t, []string{
+		"create", "delete", "fork", "push",
+		"issues", "issue_assign", "issue_label", "issue_milestone", "issue_comment",
+		"pull_request", "pull_request_assign", "pull_request_label", "pull_request_milestone",
+		"pull_request_comment", "pull_request_review_approved", "pull_request_review_rejected",
+		"pull_request_review_comment", "pull_request_sync", "repository", "release",
+	},
 		(&Webhook{
 			HookEvent: &HookEvent{SendEverything: true},
 		}).EventsArray(),
@@ -132,7 +129,7 @@ func TestGetActiveWebhooksByRepoID(t *testing.T) {
 
 func TestGetWebhooksByRepoID(t *testing.T) {
 	assert.NoError(t, PrepareTestDatabase())
-	hooks, err := GetWebhooksByRepoID(1)
+	hooks, err := GetWebhooksByRepoID(1, ListOptions{})
 	assert.NoError(t, err)
 	if assert.Len(t, hooks, 2) {
 		assert.Equal(t, int64(1), hooks[0].ID)
@@ -152,13 +149,12 @@ func TestGetActiveWebhooksByOrgID(t *testing.T) {
 
 func TestGetWebhooksByOrgID(t *testing.T) {
 	assert.NoError(t, PrepareTestDatabase())
-	hooks, err := GetWebhooksByOrgID(3)
+	hooks, err := GetWebhooksByOrgID(3, ListOptions{})
 	assert.NoError(t, err)
 	if assert.Len(t, hooks, 1) {
 		assert.Equal(t, int64(3), hooks[0].ID)
 		assert.True(t, hooks[0].IsActive)
 	}
-
 }
 
 func TestUpdateWebhook(t *testing.T) {
@@ -193,25 +189,6 @@ func TestDeleteWebhookByOrgID(t *testing.T) {
 	assert.True(t, IsErrWebhookNotExist(err))
 }
 
-func TestToHookTaskType(t *testing.T) {
-	assert.Equal(t, GOGS, ToHookTaskType("gogs"))
-	assert.Equal(t, SLACK, ToHookTaskType("slack"))
-	assert.Equal(t, GITEA, ToHookTaskType("gitea"))
-}
-
-func TestHookTaskType_Name(t *testing.T) {
-	assert.Equal(t, "gogs", GOGS.Name())
-	assert.Equal(t, "slack", SLACK.Name())
-	assert.Equal(t, "gitea", GITEA.Name())
-}
-
-func TestIsValidHookTaskType(t *testing.T) {
-	assert.True(t, IsValidHookTaskType("gogs"))
-	assert.True(t, IsValidHookTaskType("slack"))
-	assert.True(t, IsValidHookTaskType("gitea"))
-	assert.False(t, IsValidHookTaskType("invalid"))
-}
-
 func TestHookTasks(t *testing.T) {
 	assert.NoError(t, PrepareTestDatabase())
 	hookTasks, err := HookTasks(1, 1)
@@ -230,7 +207,7 @@ func TestCreateHookTask(t *testing.T) {
 	hookTask := &HookTask{
 		RepoID:    3,
 		HookID:    3,
-		Type:      GITEA,
+		Typ:       GITEA,
 		URL:       "http://www.example.com/unit_test",
 		Payloader: &api.PushPayload{},
 	}
@@ -251,22 +228,114 @@ func TestUpdateHookTask(t *testing.T) {
 	AssertExistsAndLoadBean(t, hook)
 }
 
-func TestPrepareWebhooks(t *testing.T) {
+func TestCleanupHookTaskTable_PerWebhook_DeletesDelivered(t *testing.T) {
 	assert.NoError(t, PrepareTestDatabase())
+	hookTask := &HookTask{
+		RepoID:      3,
+		HookID:      3,
+		Typ:         GITEA,
+		URL:         "http://www.example.com/unit_test",
+		Payloader:   &api.PushPayload{},
+		IsDelivered: true,
+		Delivered:   time.Now().UnixNano(),
+	}
+	AssertNotExistsBean(t, hookTask)
+	assert.NoError(t, CreateHookTask(hookTask))
+	AssertExistsAndLoadBean(t, hookTask)
 
-	repo := AssertExistsAndLoadBean(t, &Repository{ID: 1}).(*Repository)
-	hookTasks := []*HookTask{
-		{RepoID: repo.ID, HookID: 1, EventType: HookEventPush},
-	}
-	for _, hookTask := range hookTasks {
-		AssertNotExistsBean(t, hookTask)
-	}
-	assert.NoError(t, PrepareWebhooks(repo, HookEventPush, &api.PushPayload{}))
-	for _, hookTask := range hookTasks {
-		AssertExistsAndLoadBean(t, hookTask)
-	}
+	assert.NoError(t, CleanupHookTaskTable(context.Background(), PerWebhook, 168*time.Hour, 0))
+	AssertNotExistsBean(t, hookTask)
 }
 
-// TODO TestHookTask_deliver
+func TestCleanupHookTaskTable_PerWebhook_LeavesUndelivered(t *testing.T) {
+	assert.NoError(t, PrepareTestDatabase())
+	hookTask := &HookTask{
+		RepoID:      2,
+		HookID:      4,
+		Typ:         GITEA,
+		URL:         "http://www.example.com/unit_test",
+		Payloader:   &api.PushPayload{},
+		IsDelivered: false,
+	}
+	AssertNotExistsBean(t, hookTask)
+	assert.NoError(t, CreateHookTask(hookTask))
+	AssertExistsAndLoadBean(t, hookTask)
 
-// TODO TestDeliverHooks
+	assert.NoError(t, CleanupHookTaskTable(context.Background(), PerWebhook, 168*time.Hour, 0))
+	AssertExistsAndLoadBean(t, hookTask)
+}
+
+func TestCleanupHookTaskTable_PerWebhook_LeavesMostRecentTask(t *testing.T) {
+	assert.NoError(t, PrepareTestDatabase())
+	hookTask := &HookTask{
+		RepoID:      2,
+		HookID:      4,
+		Typ:         GITEA,
+		URL:         "http://www.example.com/unit_test",
+		Payloader:   &api.PushPayload{},
+		IsDelivered: true,
+		Delivered:   time.Now().UnixNano(),
+	}
+	AssertNotExistsBean(t, hookTask)
+	assert.NoError(t, CreateHookTask(hookTask))
+	AssertExistsAndLoadBean(t, hookTask)
+
+	assert.NoError(t, CleanupHookTaskTable(context.Background(), PerWebhook, 168*time.Hour, 1))
+	AssertExistsAndLoadBean(t, hookTask)
+}
+
+func TestCleanupHookTaskTable_OlderThan_DeletesDelivered(t *testing.T) {
+	assert.NoError(t, PrepareTestDatabase())
+	hookTask := &HookTask{
+		RepoID:      3,
+		HookID:      3,
+		Typ:         GITEA,
+		URL:         "http://www.example.com/unit_test",
+		Payloader:   &api.PushPayload{},
+		IsDelivered: true,
+		Delivered:   time.Now().AddDate(0, 0, -8).UnixNano(),
+	}
+	AssertNotExistsBean(t, hookTask)
+	assert.NoError(t, CreateHookTask(hookTask))
+	AssertExistsAndLoadBean(t, hookTask)
+
+	assert.NoError(t, CleanupHookTaskTable(context.Background(), OlderThan, 168*time.Hour, 0))
+	AssertNotExistsBean(t, hookTask)
+}
+
+func TestCleanupHookTaskTable_OlderThan_LeavesUndelivered(t *testing.T) {
+	assert.NoError(t, PrepareTestDatabase())
+	hookTask := &HookTask{
+		RepoID:      2,
+		HookID:      4,
+		Typ:         GITEA,
+		URL:         "http://www.example.com/unit_test",
+		Payloader:   &api.PushPayload{},
+		IsDelivered: false,
+	}
+	AssertNotExistsBean(t, hookTask)
+	assert.NoError(t, CreateHookTask(hookTask))
+	AssertExistsAndLoadBean(t, hookTask)
+
+	assert.NoError(t, CleanupHookTaskTable(context.Background(), OlderThan, 168*time.Hour, 0))
+	AssertExistsAndLoadBean(t, hookTask)
+}
+
+func TestCleanupHookTaskTable_OlderThan_LeavesTaskEarlierThanAgeToDelete(t *testing.T) {
+	assert.NoError(t, PrepareTestDatabase())
+	hookTask := &HookTask{
+		RepoID:      2,
+		HookID:      4,
+		Typ:         GITEA,
+		URL:         "http://www.example.com/unit_test",
+		Payloader:   &api.PushPayload{},
+		IsDelivered: true,
+		Delivered:   time.Now().AddDate(0, 0, -6).UnixNano(),
+	}
+	AssertNotExistsBean(t, hookTask)
+	assert.NoError(t, CreateHookTask(hookTask))
+	AssertExistsAndLoadBean(t, hookTask)
+
+	assert.NoError(t, CleanupHookTaskTable(context.Background(), OlderThan, 168*time.Hour, 0))
+	AssertExistsAndLoadBean(t, hookTask)
+}

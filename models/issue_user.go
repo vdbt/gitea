@@ -14,7 +14,6 @@ type IssueUser struct {
 	UID         int64 `xorm:"INDEX"` // User ID.
 	IssueID     int64
 	IsRead      bool
-	IsAssigned  bool
 	IsMentioned bool
 }
 
@@ -32,9 +31,8 @@ func newIssueUsers(e Engine, repo *Repository, issue *Issue) error {
 	issueUsers := make([]*IssueUser, 0, len(assignees)+1)
 	for _, assignee := range assignees {
 		issueUsers = append(issueUsers, &IssueUser{
-			IssueID:    issue.ID,
-			UID:        assignee.ID,
-			IsAssigned: assignee.ID == issue.AssigneeID,
+			IssueID: issue.ID,
+			UID:     assignee.ID,
 		})
 		isPosterAssignee = isPosterAssignee || assignee.ID == issue.PosterID
 	}
@@ -51,36 +49,6 @@ func newIssueUsers(e Engine, repo *Repository, issue *Issue) error {
 	return nil
 }
 
-func updateIssueUserByAssignee(e Engine, issue *Issue) (err error) {
-	if _, err = e.Exec("UPDATE `issue_user` SET is_assigned = ? WHERE issue_id = ?", false, issue.ID); err != nil {
-		return err
-	}
-
-	// Assignee ID equals to 0 means clear assignee.
-	if issue.AssigneeID > 0 {
-		if _, err = e.Exec("UPDATE `issue_user` SET is_assigned = ? WHERE uid = ? AND issue_id = ?", true, issue.AssigneeID, issue.ID); err != nil {
-			return err
-		}
-	}
-
-	return updateIssue(e, issue)
-}
-
-// UpdateIssueUserByAssignee updates issue-user relation for assignee.
-func UpdateIssueUserByAssignee(issue *Issue) (err error) {
-	sess := x.NewSession()
-	defer sess.Close()
-	if err = sess.Begin(); err != nil {
-		return err
-	}
-
-	if err = updateIssueUserByAssignee(sess, issue); err != nil {
-		return err
-	}
-
-	return sess.Commit()
-}
-
 // UpdateIssueUserByRead updates issue-user relation for reading.
 func UpdateIssueUserByRead(uid, issueID int64) error {
 	_, err := x.Exec("UPDATE `issue_user` SET is_read=? WHERE uid=? AND issue_id=?", true, uid, issueID)
@@ -88,22 +56,22 @@ func UpdateIssueUserByRead(uid, issueID int64) error {
 }
 
 // UpdateIssueUsersByMentions updates issue-user pairs by mentioning.
-func UpdateIssueUsersByMentions(e Engine, issueID int64, uids []int64) error {
+func UpdateIssueUsersByMentions(ctx DBContext, issueID int64, uids []int64) error {
 	for _, uid := range uids {
 		iu := &IssueUser{
 			UID:     uid,
 			IssueID: issueID,
 		}
-		has, err := e.Get(iu)
+		has, err := ctx.e.Get(iu)
 		if err != nil {
 			return err
 		}
 
 		iu.IsMentioned = true
 		if has {
-			_, err = e.ID(iu.ID).Cols("is_mentioned").Update(iu)
+			_, err = ctx.e.ID(iu.ID).Cols("is_mentioned").Update(iu)
 		} else {
-			_, err = e.Insert(iu)
+			_, err = ctx.e.Insert(iu)
 		}
 		if err != nil {
 			return err

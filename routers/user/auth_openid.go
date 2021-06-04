@@ -6,17 +6,21 @@ package user
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 
 	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/auth"
 	"code.gitea.io/gitea/modules/auth/openid"
 	"code.gitea.io/gitea/modules/base"
 	"code.gitea.io/gitea/modules/context"
+	"code.gitea.io/gitea/modules/hcaptcha"
 	"code.gitea.io/gitea/modules/log"
+	"code.gitea.io/gitea/modules/recaptcha"
 	"code.gitea.io/gitea/modules/setting"
-
-	"github.com/go-macaron/captcha"
+	"code.gitea.io/gitea/modules/util"
+	"code.gitea.io/gitea/modules/web"
+	"code.gitea.io/gitea/modules/web/middleware"
+	"code.gitea.io/gitea/services/forms"
 )
 
 const (
@@ -37,30 +41,26 @@ func SignInOpenID(ctx *context.Context) {
 	// Check auto-login.
 	isSucceed, err := AutoSignIn(ctx)
 	if err != nil {
-		ctx.Handle(500, "AutoSignIn", err)
+		ctx.ServerError("AutoSignIn", err)
 		return
 	}
 
 	redirectTo := ctx.Query("redirect_to")
 	if len(redirectTo) > 0 {
-		ctx.SetCookie("redirect_to", redirectTo, 0, setting.AppSubURL)
+		middleware.SetRedirectToCookie(ctx.Resp, redirectTo)
 	} else {
-		redirectTo, _ = url.QueryUnescape(ctx.GetCookie("redirect_to"))
+		redirectTo = ctx.GetCookie("redirect_to")
 	}
 
 	if isSucceed {
-		if len(redirectTo) > 0 {
-			ctx.SetCookie("redirect_to", "", -1, setting.AppSubURL)
-			ctx.Redirect(redirectTo)
-		} else {
-			ctx.Redirect(setting.AppSubURL + "/")
-		}
+		middleware.DeleteRedirectToCookie(ctx.Resp)
+		ctx.RedirectToFirst(redirectTo)
 		return
 	}
 
 	ctx.Data["PageIsSignIn"] = true
 	ctx.Data["PageIsLoginOpenID"] = true
-	ctx.HTML(200, tplSignInOpenID)
+	ctx.HTML(http.StatusOK, tplSignInOpenID)
 }
 
 // Check if the given OpenID URI is allowed by blacklist/whitelist
@@ -89,13 +89,14 @@ func allowedOpenIDURI(uri string) (err error) {
 }
 
 // SignInOpenIDPost response for openid sign in request
-func SignInOpenIDPost(ctx *context.Context, form auth.SignInOpenIDForm) {
+func SignInOpenIDPost(ctx *context.Context) {
+	form := web.GetForm(ctx).(*forms.SignInOpenIDForm)
 	ctx.Data["Title"] = ctx.Tr("sign_in")
 	ctx.Data["PageIsSignIn"] = true
 	ctx.Data["PageIsLoginOpenID"] = true
 
 	if ctx.HasError() {
-		ctx.HTML(200, tplSignInOpenID)
+		ctx.HTML(http.StatusOK, tplSignInOpenID)
 		return
 	}
 
@@ -117,7 +118,8 @@ func SignInOpenIDPost(ctx *context.Context, form auth.SignInOpenIDForm) {
 	redirectTo := setting.AppURL + "user/login/openid"
 	url, err := openid.RedirectURL(id, redirectTo, setting.AppURL)
 	if err != nil {
-		ctx.RenderWithErr(err.Error(), tplSignInOpenID, &form)
+		log.Error("Error in OpenID redirect URL: %s, %v", redirectTo, err.Error())
+		ctx.RenderWithErr(fmt.Sprintf("Unable to find OpenID provider in %s", redirectTo), tplSignInOpenID, &form)
 		return
 	}
 
@@ -126,8 +128,14 @@ func SignInOpenIDPost(ctx *context.Context, form auth.SignInOpenIDForm) {
 	url += "&openid.ns.sreg=http%3A%2F%2Fopenid.net%2Fextensions%2Fsreg%2F1.1"
 	url += "&openid.sreg.optional=nickname%2Cemail"
 
-	log.Trace("Form-passed openid-remember: %s", form.Remember)
-	ctx.Session.Set("openid_signin_remember", form.Remember)
+	log.Trace("Form-passed openid-remember: %t", form.Remember)
+
+	if err := ctx.Session.Set("openid_signin_remember", form.Remember); err != nil {
+		log.Error("SignInOpenIDPost: Could not set openid_signin_remember in session: %v", err)
+	}
+	if err := ctx.Session.Release(); err != nil {
+		log.Error("SignInOpenIDPost: Unable to save changes to the session: %v", err)
+	}
 
 	ctx.Redirect(url)
 }
@@ -135,14 +143,14 @@ func SignInOpenIDPost(ctx *context.Context, form auth.SignInOpenIDForm) {
 // signInOpenIDVerify handles response from OpenID provider
 func signInOpenIDVerify(ctx *context.Context) {
 
-	log.Trace("Incoming call to: " + ctx.Req.Request.URL.String())
+	log.Trace("Incoming call to: " + ctx.Req.URL.String())
 
-	fullURL := setting.AppURL + ctx.Req.Request.URL.String()[1:]
+	fullURL := setting.AppURL + ctx.Req.URL.String()[1:]
 	log.Trace("Full URL: " + fullURL)
 
 	var id, err = openid.Verify(fullURL)
 	if err != nil {
-		ctx.RenderWithErr(err.Error(), tplSignInOpenID, &auth.SignInOpenIDForm{
+		ctx.RenderWithErr(err.Error(), tplSignInOpenID, &forms.SignInOpenIDForm{
 			Openid: id,
 		})
 		return
@@ -153,19 +161,20 @@ func signInOpenIDVerify(ctx *context.Context) {
 	/* Now we should seek for the user and log him in, or prompt
 	 * to register if not found */
 
-	u, _ := models.GetUserByOpenID(id)
+	u, err := models.GetUserByOpenID(id)
 	if err != nil {
 		if !models.IsErrUserNotExist(err) {
-			ctx.RenderWithErr(err.Error(), tplSignInOpenID, &auth.SignInOpenIDForm{
+			ctx.RenderWithErr(err.Error(), tplSignInOpenID, &forms.SignInOpenIDForm{
 				Openid: id,
 			})
 			return
 		}
+		log.Error("signInOpenIDVerify: %v", err)
 	}
 	if u != nil {
 		log.Trace("User exists, logging in")
 		remember, _ := ctx.Session.Get("openid_signin_remember").(bool)
-		log.Trace("Session stored openid-remember: %s", remember)
+		log.Trace("Session stored openid-remember: %t", remember)
 		handleSignIn(ctx, u, remember)
 		return
 	}
@@ -174,14 +183,14 @@ func signInOpenIDVerify(ctx *context.Context) {
 
 	parsedURL, err := url.Parse(fullURL)
 	if err != nil {
-		ctx.RenderWithErr(err.Error(), tplSignInOpenID, &auth.SignInOpenIDForm{
+		ctx.RenderWithErr(err.Error(), tplSignInOpenID, &forms.SignInOpenIDForm{
 			Openid: id,
 		})
 		return
 	}
 	values, err := url.ParseQuery(parsedURL.RawQuery)
 	if err != nil {
-		ctx.RenderWithErr(err.Error(), tplSignInOpenID, &auth.SignInOpenIDForm{
+		ctx.RenderWithErr(err.Error(), tplSignInOpenID, &forms.SignInOpenIDForm{
 			Openid: id,
 		})
 		return
@@ -192,14 +201,15 @@ func signInOpenIDVerify(ctx *context.Context) {
 	log.Trace("User has email=" + email + " and nickname=" + nickname)
 
 	if email != "" {
-		u, _ = models.GetUserByEmail(email)
+		u, err = models.GetUserByEmail(email)
 		if err != nil {
 			if !models.IsErrUserNotExist(err) {
-				ctx.RenderWithErr(err.Error(), tplSignInOpenID, &auth.SignInOpenIDForm{
+				ctx.RenderWithErr(err.Error(), tplSignInOpenID, &forms.SignInOpenIDForm{
 					Openid: id,
 				})
 				return
 			}
+			log.Error("signInOpenIDVerify: %v", err)
 		}
 		if u != nil {
 			log.Trace("Local user " + u.LowerName + " has OpenID provided email " + email)
@@ -210,7 +220,7 @@ func signInOpenIDVerify(ctx *context.Context) {
 		u, _ = models.GetUserByName(nickname)
 		if err != nil {
 			if !models.IsErrUserNotExist(err) {
-				ctx.RenderWithErr(err.Error(), tplSignInOpenID, &auth.SignInOpenIDForm{
+				ctx.RenderWithErr(err.Error(), tplSignInOpenID, &forms.SignInOpenIDForm{
 					Openid: id,
 				})
 				return
@@ -221,17 +231,25 @@ func signInOpenIDVerify(ctx *context.Context) {
 		}
 	}
 
-	ctx.Session.Set("openid_verified_uri", id)
-
-	ctx.Session.Set("openid_determined_email", email)
+	if err := ctx.Session.Set("openid_verified_uri", id); err != nil {
+		log.Error("signInOpenIDVerify: Could not set openid_verified_uri in session: %v", err)
+	}
+	if err := ctx.Session.Set("openid_determined_email", email); err != nil {
+		log.Error("signInOpenIDVerify: Could not set openid_determined_email in session: %v", err)
+	}
 
 	if u != nil {
 		nickname = u.LowerName
 	}
 
-	ctx.Session.Set("openid_determined_username", nickname)
+	if err := ctx.Session.Set("openid_determined_username", nickname); err != nil {
+		log.Error("signInOpenIDVerify: Could not set openid_determined_username in session: %v", err)
+	}
+	if err := ctx.Session.Release(); err != nil {
+		log.Error("signInOpenIDVerify: Unable to save changes to the session: %v", err)
+	}
 
-	if u != nil || !setting.Service.EnableOpenIDSignUp {
+	if u != nil || !setting.Service.EnableOpenIDSignUp || setting.Service.AllowOnlyInternalRegistration {
 		ctx.Redirect(setting.AppSubURL + "/user/openid/connect")
 	} else {
 		ctx.Redirect(setting.AppSubURL + "/user/openid/register")
@@ -249,17 +267,18 @@ func ConnectOpenID(ctx *context.Context) {
 	ctx.Data["PageIsSignIn"] = true
 	ctx.Data["PageIsOpenIDConnect"] = true
 	ctx.Data["EnableOpenIDSignUp"] = setting.Service.EnableOpenIDSignUp
+	ctx.Data["AllowOnlyInternalRegistration"] = setting.Service.AllowOnlyInternalRegistration
 	ctx.Data["OpenID"] = oid
 	userName, _ := ctx.Session.Get("openid_determined_username").(string)
 	if userName != "" {
 		ctx.Data["user_name"] = userName
 	}
-	ctx.HTML(200, tplConnectOID)
+	ctx.HTML(http.StatusOK, tplConnectOID)
 }
 
 // ConnectOpenIDPost handles submission of a form to connect an OpenID URI to an existing account
-func ConnectOpenIDPost(ctx *context.Context, form auth.ConnectOpenIDForm) {
-
+func ConnectOpenIDPost(ctx *context.Context) {
+	form := web.GetForm(ctx).(*forms.ConnectOpenIDForm)
 	oid, _ := ctx.Session.Get("openid_verified_uri").(string)
 	if oid == "" {
 		ctx.Redirect(setting.AppSubURL + "/user/login/openid")
@@ -276,7 +295,7 @@ func ConnectOpenIDPost(ctx *context.Context, form auth.ConnectOpenIDForm) {
 		if models.IsErrUserNotExist(err) {
 			ctx.RenderWithErr(ctx.Tr("form.username_password_incorrect"), tplConnectOID, &form)
 		} else {
-			ctx.Handle(500, "ConnectOpenIDPost", err)
+			ctx.ServerError("ConnectOpenIDPost", err)
 		}
 		return
 	}
@@ -288,14 +307,14 @@ func ConnectOpenIDPost(ctx *context.Context, form auth.ConnectOpenIDForm) {
 			ctx.RenderWithErr(ctx.Tr("form.openid_been_used", oid), tplConnectOID, &form)
 			return
 		}
-		ctx.Handle(500, "AddUserOpenID", err)
+		ctx.ServerError("AddUserOpenID", err)
 		return
 	}
 
 	ctx.Flash.Success(ctx.Tr("settings.add_openid_success"))
 
 	remember, _ := ctx.Session.Get("openid_signin_remember").(bool)
-	log.Trace("Session stored openid-remember: %s", remember)
+	log.Trace("Session stored openid-remember: %t", remember)
 	handleSignIn(ctx, u, remember)
 }
 
@@ -310,7 +329,13 @@ func RegisterOpenID(ctx *context.Context) {
 	ctx.Data["PageIsSignIn"] = true
 	ctx.Data["PageIsOpenIDRegister"] = true
 	ctx.Data["EnableOpenIDSignUp"] = setting.Service.EnableOpenIDSignUp
+	ctx.Data["AllowOnlyInternalRegistration"] = setting.Service.AllowOnlyInternalRegistration
 	ctx.Data["EnableCaptcha"] = setting.Service.EnableCaptcha
+	ctx.Data["Captcha"] = context.GetImageCaptcha()
+	ctx.Data["CaptchaType"] = setting.Service.CaptchaType
+	ctx.Data["RecaptchaSitekey"] = setting.Service.RecaptchaSitekey
+	ctx.Data["HcaptchaSitekey"] = setting.Service.HcaptchaSitekey
+	ctx.Data["RecaptchaURL"] = setting.Service.RecaptchaURL
 	ctx.Data["OpenID"] = oid
 	userName, _ := ctx.Session.Get("openid_determined_username").(string)
 	if userName != "" {
@@ -320,11 +345,12 @@ func RegisterOpenID(ctx *context.Context) {
 	if email != "" {
 		ctx.Data["email"] = email
 	}
-	ctx.HTML(200, tplSignUpOID)
+	ctx.HTML(http.StatusOK, tplSignUpOID)
 }
 
 // RegisterOpenIDPost handles submission of a form to create a new user authenticated via an OpenID URI
-func RegisterOpenIDPost(ctx *context.Context, cpt *captcha.Captcha, form auth.SignUpOpenIDForm) {
+func RegisterOpenIDPost(ctx *context.Context) {
+	form := web.GetForm(ctx).(*forms.SignUpOpenIDForm)
 	oid, _ := ctx.Session.Get("openid_verified_uri").(string)
 	if oid == "" {
 		ctx.Redirect(setting.AppSubURL + "/user/login/openid")
@@ -336,51 +362,71 @@ func RegisterOpenIDPost(ctx *context.Context, cpt *captcha.Captcha, form auth.Si
 	ctx.Data["PageIsOpenIDRegister"] = true
 	ctx.Data["EnableOpenIDSignUp"] = setting.Service.EnableOpenIDSignUp
 	ctx.Data["EnableCaptcha"] = setting.Service.EnableCaptcha
+	ctx.Data["RecaptchaURL"] = setting.Service.RecaptchaURL
+	ctx.Data["Captcha"] = context.GetImageCaptcha()
+	ctx.Data["CaptchaType"] = setting.Service.CaptchaType
+	ctx.Data["RecaptchaSitekey"] = setting.Service.RecaptchaSitekey
+	ctx.Data["HcaptchaSitekey"] = setting.Service.HcaptchaSitekey
 	ctx.Data["OpenID"] = oid
 
-	if setting.Service.EnableCaptcha && !cpt.VerifyReq(ctx.Req) {
-		ctx.Data["Err_Captcha"] = true
-		ctx.RenderWithErr(ctx.Tr("form.captcha_incorrect"), tplSignUpOID, &form)
+	if setting.Service.AllowOnlyInternalRegistration {
+		ctx.Error(http.StatusForbidden)
 		return
 	}
 
-	len := setting.MinPasswordLength
-	if len < 256 {
-		len = 256
+	if setting.Service.EnableCaptcha {
+		var valid bool
+		var err error
+		switch setting.Service.CaptchaType {
+		case setting.ImageCaptcha:
+			valid = context.GetImageCaptcha().VerifyReq(ctx.Req)
+		case setting.ReCaptcha:
+			if err := ctx.Req.ParseForm(); err != nil {
+				ctx.ServerError("", err)
+				return
+			}
+			valid, err = recaptcha.Verify(ctx, form.GRecaptchaResponse)
+		case setting.HCaptcha:
+			if err := ctx.Req.ParseForm(); err != nil {
+				ctx.ServerError("", err)
+				return
+			}
+			valid, err = hcaptcha.Verify(ctx, form.HcaptchaResponse)
+		default:
+			ctx.ServerError("Unknown Captcha Type", fmt.Errorf("Unknown Captcha Type: %s", setting.Service.CaptchaType))
+			return
+		}
+		if err != nil {
+			log.Debug("%s", err.Error())
+		}
+
+		if !valid {
+			ctx.Data["Err_Captcha"] = true
+			ctx.RenderWithErr(ctx.Tr("form.captcha_incorrect"), tplSignUpOID, &form)
+			return
+		}
 	}
-	password, err := base.GetRandomString(len)
+
+	length := setting.MinPasswordLength
+	if length < 256 {
+		length = 256
+	}
+	password, err := util.RandomString(int64(length))
 	if err != nil {
 		ctx.RenderWithErr(err.Error(), tplSignUpOID, form)
 		return
 	}
 
-	// TODO: abstract a finalizeSignUp function ?
 	u := &models.User{
 		Name:     form.UserName,
 		Email:    form.Email,
 		Passwd:   password,
-		IsActive: !setting.Service.RegisterEmailConfirm,
+		IsActive: !(setting.Service.RegisterEmailConfirm || setting.Service.RegisterManualConfirm),
 	}
-	if err := models.CreateUser(u); err != nil {
-		switch {
-		case models.IsErrUserAlreadyExist(err):
-			ctx.Data["Err_UserName"] = true
-			ctx.RenderWithErr(ctx.Tr("form.username_been_taken"), tplSignUpOID, &form)
-		case models.IsErrEmailAlreadyUsed(err):
-			ctx.Data["Err_Email"] = true
-			ctx.RenderWithErr(ctx.Tr("form.email_been_used"), tplSignUpOID, &form)
-		case models.IsErrNameReserved(err):
-			ctx.Data["Err_UserName"] = true
-			ctx.RenderWithErr(ctx.Tr("user.form.name_reserved", err.(models.ErrNameReserved).Name), tplSignUpOID, &form)
-		case models.IsErrNamePatternNotAllowed(err):
-			ctx.Data["Err_UserName"] = true
-			ctx.RenderWithErr(ctx.Tr("user.form.name_pattern_not_allowed", err.(models.ErrNamePatternNotAllowed).Pattern), tplSignUpOID, &form)
-		default:
-			ctx.Handle(500, "CreateUser", err)
-		}
+	if !createUserInContext(ctx, tplSignUpOID, form, u, nil, false) {
+		// error already handled
 		return
 	}
-	log.Trace("Account created: %s", u.Name)
 
 	// add OpenID for the user
 	userOID := &models.UserOpenID{UID: u.ID, URI: oid}
@@ -389,36 +435,16 @@ func RegisterOpenIDPost(ctx *context.Context, cpt *captcha.Captcha, form auth.Si
 			ctx.RenderWithErr(ctx.Tr("form.openid_been_used", oid), tplSignUpOID, &form)
 			return
 		}
-		ctx.Handle(500, "AddUserOpenID", err)
+		ctx.ServerError("AddUserOpenID", err)
 		return
 	}
 
-	// Auto-set admin for the only user.
-	if models.CountUsers() == 1 {
-		u.IsAdmin = true
-		u.IsActive = true
-		u.SetLastLogin()
-		if err := models.UpdateUserCols(u, "is_admin", "is_active", "last_login_unix"); err != nil {
-			ctx.Handle(500, "UpdateUser", err)
-			return
-		}
-	}
-
-	// Send confirmation email, no need for social account.
-	if setting.Service.RegisterEmailConfirm && u.ID > 1 {
-		models.SendActivateAccountMail(ctx.Context, u)
-		ctx.Data["IsSendRegisterMail"] = true
-		ctx.Data["Email"] = u.Email
-		ctx.Data["ActiveCodeLives"] = base.MinutesToFriendly(setting.Service.ActiveCodeLives, ctx.Locale.Language())
-		ctx.HTML(200, TplActivate)
-
-		if err := ctx.Cache.Put("MailResendLimit_"+u.LowerName, u.LowerName, 180); err != nil {
-			log.Error(4, "Set cache(MailResendLimit) fail: %v", err)
-		}
+	if !handleUserCreated(ctx, u, nil) {
+		// error already handled
 		return
 	}
 
 	remember, _ := ctx.Session.Get("openid_signin_remember").(bool)
-	log.Trace("Session stored openid-remember: %s", remember)
+	log.Trace("Session stored openid-remember: %t", remember)
 	handleSignIn(ctx, u, remember)
 }

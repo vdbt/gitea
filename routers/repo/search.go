@@ -5,15 +5,13 @@
 package repo
 
 import (
-	"path"
+	"net/http"
 	"strings"
 
 	"code.gitea.io/gitea/modules/base"
 	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/search"
+	code_indexer "code.gitea.io/gitea/modules/indexer/code"
 	"code.gitea.io/gitea/modules/setting"
-
-	"github.com/Unknwon/paginater"
 )
 
 const tplSearch base.TplName = "repo/search"
@@ -24,23 +22,34 @@ func Search(ctx *context.Context) {
 		ctx.Redirect(ctx.Repo.RepoLink, 302)
 		return
 	}
+	language := strings.TrimSpace(ctx.Query("l"))
 	keyword := strings.TrimSpace(ctx.Query("q"))
 	page := ctx.QueryInt("page")
 	if page <= 0 {
 		page = 1
 	}
-	total, searchResults, err := search.PerformSearch(ctx.Repo.Repository.ID, keyword, page, setting.UI.RepoSearchPagingNum)
+	queryType := strings.TrimSpace(ctx.Query("t"))
+	isMatch := queryType == "match"
+
+	total, searchResults, searchResultLanguages, err := code_indexer.PerformSearch([]int64{ctx.Repo.Repository.ID},
+		language, keyword, page, setting.UI.RepoSearchPagingNum, isMatch)
 	if err != nil {
-		ctx.Handle(500, "SearchResults", err)
+		ctx.ServerError("SearchResults", err)
 		return
 	}
 	ctx.Data["Keyword"] = keyword
-	pager := paginater.New(total, setting.UI.RepoSearchPagingNum, page, 5)
-	ctx.Data["Page"] = pager
-	ctx.Data["SourcePath"] = setting.AppSubURL + "/" +
-		path.Join(ctx.Repo.Repository.Owner.Name, ctx.Repo.Repository.Name, "src", ctx.Repo.Repository.DefaultBranch)
+	ctx.Data["Language"] = language
+	ctx.Data["queryType"] = queryType
+	ctx.Data["SourcePath"] = ctx.Repo.Repository.HTMLURL()
 	ctx.Data["SearchResults"] = searchResults
+	ctx.Data["SearchResultLanguages"] = searchResultLanguages
 	ctx.Data["RequireHighlightJS"] = true
 	ctx.Data["PageIsViewCode"] = true
-	ctx.HTML(200, tplSearch)
+
+	pager := context.NewPagination(total, setting.UI.RepoSearchPagingNum, page, 5)
+	pager.SetDefaultParams(ctx)
+	pager.AddParam(ctx, "l", "Language")
+	ctx.Data["Page"] = pager
+
+	ctx.HTML(http.StatusOK, tplSearch)
 }
