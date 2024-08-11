@@ -1,6 +1,5 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package repo
 
@@ -8,8 +7,9 @@ import (
 	"net/http"
 
 	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/convert"
+	repo_model "code.gitea.io/gitea/models/repo"
+	"code.gitea.io/gitea/services/context"
+	"code.gitea.io/gitea/services/convert"
 	releaseservice "code.gitea.io/gitea/services/release"
 )
 
@@ -42,11 +42,11 @@ func GetReleaseByTag(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	tag := ctx.Params(":tag")
+	tag := ctx.PathParam(":tag")
 
-	release, err := models.GetRelease(ctx.Repo.Repository.ID, tag)
+	release, err := repo_model.GetRelease(ctx, ctx.Repo.Repository.ID, tag)
 	if err != nil {
-		if models.IsErrReleaseNotExist(err) {
+		if repo_model.IsErrReleaseNotExist(err) {
 			ctx.NotFound()
 			return
 		}
@@ -59,11 +59,11 @@ func GetReleaseByTag(ctx *context.APIContext) {
 		return
 	}
 
-	if err = release.LoadAttributes(); err != nil {
+	if err = release.LoadAttributes(ctx); err != nil {
 		ctx.Error(http.StatusInternalServerError, "LoadAttributes", err)
 		return
 	}
-	ctx.JSON(http.StatusOK, convert.ToRelease(release))
+	ctx.JSON(http.StatusOK, convert.ToAPIRelease(ctx, ctx.Repo.Repository, release))
 }
 
 // DeleteReleaseByTag delete a release from a repository by tag name
@@ -92,12 +92,14 @@ func DeleteReleaseByTag(ctx *context.APIContext) {
 	//     "$ref": "#/responses/empty"
 	//   "404":
 	//     "$ref": "#/responses/notFound"
+	//   "422":
+	//     "$ref": "#/responses/validationError"
 
-	tag := ctx.Params(":tag")
+	tag := ctx.PathParam(":tag")
 
-	release, err := models.GetRelease(ctx.Repo.Repository.ID, tag)
+	release, err := repo_model.GetRelease(ctx, ctx.Repo.Repository.ID, tag)
 	if err != nil {
-		if models.IsErrReleaseNotExist(err) {
+		if repo_model.IsErrReleaseNotExist(err) {
 			ctx.NotFound()
 			return
 		}
@@ -110,8 +112,13 @@ func DeleteReleaseByTag(ctx *context.APIContext) {
 		return
 	}
 
-	if err = releaseservice.DeleteReleaseByID(release.ID, ctx.User, false); err != nil {
+	if err = releaseservice.DeleteReleaseByID(ctx, ctx.Repo.Repository, release, ctx.Doer, false); err != nil {
+		if models.IsErrProtectedTagName(err) {
+			ctx.Error(http.StatusUnprocessableEntity, "delTag", "user not allowed to delete protected tag")
+			return
+		}
 		ctx.Error(http.StatusInternalServerError, "DeleteReleaseByID", err)
+		return
 	}
 
 	ctx.Status(http.StatusNoContent)

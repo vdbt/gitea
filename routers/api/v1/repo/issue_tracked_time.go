@@ -1,21 +1,22 @@
 // Copyright 2017 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package repo
 
 import (
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
-	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/convert"
+	"code.gitea.io/gitea/models/db"
+	issues_model "code.gitea.io/gitea/models/issues"
+	"code.gitea.io/gitea/models/unit"
+	user_model "code.gitea.io/gitea/models/user"
 	api "code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/web"
 	"code.gitea.io/gitea/routers/api/v1/utils"
+	"code.gitea.io/gitea/services/context"
+	"code.gitea.io/gitea/services/convert"
 )
 
 // ListTrackedTimes list all the tracked times of an issue
@@ -70,13 +71,13 @@ func ListTrackedTimes(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	if !ctx.Repo.Repository.IsTimetrackerEnabled() {
+	if !ctx.Repo.Repository.IsTimetrackerEnabled(ctx) {
 		ctx.NotFound("Timetracker is disabled")
 		return
 	}
-	issue, err := models.GetIssueByIndex(ctx.Repo.Repository.ID, ctx.ParamsInt64(":index"))
+	issue, err := issues_model.GetIssueByIndex(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64(":index"))
 	if err != nil {
-		if models.IsErrIssueNotExist(err) {
+		if issues_model.IsErrIssueNotExist(err) {
 			ctx.NotFound(err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "GetIssueByIndex", err)
@@ -84,16 +85,16 @@ func ListTrackedTimes(ctx *context.APIContext) {
 		return
 	}
 
-	opts := models.FindTrackedTimesOptions{
+	opts := &issues_model.FindTrackedTimesOptions{
 		ListOptions:  utils.GetListOptions(ctx),
 		RepositoryID: ctx.Repo.Repository.ID,
 		IssueID:      issue.ID,
 	}
 
-	qUser := strings.Trim(ctx.Query("user"), " ")
+	qUser := ctx.FormTrim("user")
 	if qUser != "" {
-		user, err := models.GetUserByName(qUser)
-		if models.IsErrUserNotExist(err) {
+		user, err := user_model.GetUserByName(ctx, qUser)
+		if user_model.IsErrUserNotExist(err) {
 			ctx.Error(http.StatusNotFound, "User does not exist", err)
 		} else if err != nil {
 			ctx.Error(http.StatusInternalServerError, "GetUserByName", err)
@@ -102,34 +103,42 @@ func ListTrackedTimes(ctx *context.APIContext) {
 		opts.UserID = user.ID
 	}
 
-	if opts.CreatedBeforeUnix, opts.CreatedAfterUnix, err = utils.GetQueryBeforeSince(ctx); err != nil {
+	if opts.CreatedBeforeUnix, opts.CreatedAfterUnix, err = context.GetQueryBeforeSince(ctx.Base); err != nil {
 		ctx.Error(http.StatusUnprocessableEntity, "GetQueryBeforeSince", err)
 		return
 	}
 
-	cantSetUser := !ctx.User.IsAdmin &&
-		opts.UserID != ctx.User.ID &&
-		!ctx.IsUserRepoWriter([]models.UnitType{models.UnitTypeIssues})
+	cantSetUser := !ctx.Doer.IsAdmin &&
+		opts.UserID != ctx.Doer.ID &&
+		!ctx.IsUserRepoWriter([]unit.Type{unit.TypeIssues})
 
 	if cantSetUser {
 		if opts.UserID == 0 {
-			opts.UserID = ctx.User.ID
+			opts.UserID = ctx.Doer.ID
 		} else {
 			ctx.Error(http.StatusForbidden, "", fmt.Errorf("query by user not allowed; not enough rights"))
 			return
 		}
 	}
 
-	trackedTimes, err := models.GetTrackedTimes(opts)
+	count, err := issues_model.CountTrackedTimes(ctx, opts)
+	if err != nil {
+		ctx.InternalServerError(err)
+		return
+	}
+
+	trackedTimes, err := issues_model.GetTrackedTimes(ctx, opts)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "GetTrackedTimes", err)
 		return
 	}
-	if err = trackedTimes.LoadAttributes(); err != nil {
+	if err = trackedTimes.LoadAttributes(ctx); err != nil {
 		ctx.Error(http.StatusInternalServerError, "LoadAttributes", err)
 		return
 	}
-	ctx.JSON(http.StatusOK, convert.ToTrackedTimeList(trackedTimes))
+
+	ctx.SetTotalCountHeader(count)
+	ctx.JSON(http.StatusOK, convert.ToTrackedTimeList(ctx, ctx.Doer, trackedTimes))
 }
 
 // AddTime add time manual to the given issue
@@ -169,10 +178,12 @@ func AddTime(ctx *context.APIContext) {
 	//     "$ref": "#/responses/error"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 	form := web.GetForm(ctx).(*api.AddTimeOption)
-	issue, err := models.GetIssueByIndex(ctx.Repo.Repository.ID, ctx.ParamsInt64(":index"))
+	issue, err := issues_model.GetIssueByIndex(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64(":index"))
 	if err != nil {
-		if models.IsErrIssueNotExist(err) {
+		if issues_model.IsErrIssueNotExist(err) {
 			ctx.NotFound(err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "GetIssueByIndex", err)
@@ -180,8 +191,8 @@ func AddTime(ctx *context.APIContext) {
 		return
 	}
 
-	if !ctx.Repo.CanUseTimetracker(issue, ctx.User) {
-		if !ctx.Repo.Repository.IsTimetrackerEnabled() {
+	if !ctx.Repo.CanUseTimetracker(ctx, issue, ctx.Doer) {
+		if !ctx.Repo.Repository.IsTimetrackerEnabled(ctx) {
 			ctx.Error(http.StatusBadRequest, "", "time tracking disabled")
 			return
 		}
@@ -189,11 +200,11 @@ func AddTime(ctx *context.APIContext) {
 		return
 	}
 
-	user := ctx.User
+	user := ctx.Doer
 	if form.User != "" {
-		if (ctx.IsUserRepoAdmin() && ctx.User.Name != form.User) || ctx.User.IsAdmin {
-			//allow only RepoAdmin, Admin and User to add time
-			user, err = models.GetUserByName(form.User)
+		if (ctx.IsUserRepoAdmin() && ctx.Doer.Name != form.User) || ctx.Doer.IsAdmin {
+			// allow only RepoAdmin, Admin and User to add time
+			user, err = user_model.GetUserByName(ctx, form.User)
 			if err != nil {
 				ctx.Error(http.StatusInternalServerError, "GetUserByName", err)
 			}
@@ -205,16 +216,16 @@ func AddTime(ctx *context.APIContext) {
 		created = form.Created
 	}
 
-	trackedTime, err := models.AddTime(user, issue, form.Time, created)
+	trackedTime, err := issues_model.AddTime(ctx, user, issue, form.Time, created)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "AddTime", err)
 		return
 	}
-	if err = trackedTime.LoadAttributes(); err != nil {
+	if err = trackedTime.LoadAttributes(ctx); err != nil {
 		ctx.Error(http.StatusInternalServerError, "LoadAttributes", err)
 		return
 	}
-	ctx.JSON(http.StatusOK, convert.ToTrackedTime(trackedTime))
+	ctx.JSON(http.StatusOK, convert.ToTrackedTime(ctx, user, trackedTime))
 }
 
 // ResetIssueTime reset time manual to the given issue
@@ -250,10 +261,12 @@ func ResetIssueTime(ctx *context.APIContext) {
 	//     "$ref": "#/responses/error"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
-	issue, err := models.GetIssueByIndex(ctx.Repo.Repository.ID, ctx.ParamsInt64(":index"))
+	issue, err := issues_model.GetIssueByIndex(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64(":index"))
 	if err != nil {
-		if models.IsErrIssueNotExist(err) {
+		if issues_model.IsErrIssueNotExist(err) {
 			ctx.NotFound(err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "GetIssueByIndex", err)
@@ -261,8 +274,8 @@ func ResetIssueTime(ctx *context.APIContext) {
 		return
 	}
 
-	if !ctx.Repo.CanUseTimetracker(issue, ctx.User) {
-		if !ctx.Repo.Repository.IsTimetrackerEnabled() {
+	if !ctx.Repo.CanUseTimetracker(ctx, issue, ctx.Doer) {
+		if !ctx.Repo.Repository.IsTimetrackerEnabled(ctx) {
 			ctx.JSON(http.StatusBadRequest, struct{ Message string }{Message: "time tracking disabled"})
 			return
 		}
@@ -270,16 +283,16 @@ func ResetIssueTime(ctx *context.APIContext) {
 		return
 	}
 
-	err = models.DeleteIssueUserTimes(issue, ctx.User)
+	err = issues_model.DeleteIssueUserTimes(ctx, issue, ctx.Doer)
 	if err != nil {
-		if models.IsErrNotExist(err) {
+		if db.IsErrNotExist(err) {
 			ctx.Error(http.StatusNotFound, "DeleteIssueUserTimes", err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "DeleteIssueUserTimes", err)
 		}
 		return
 	}
-	ctx.Status(204)
+	ctx.Status(http.StatusNoContent)
 }
 
 // DeleteTime delete a specific time by id
@@ -321,10 +334,12 @@ func DeleteTime(ctx *context.APIContext) {
 	//     "$ref": "#/responses/error"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
-	issue, err := models.GetIssueByIndex(ctx.Repo.Repository.ID, ctx.ParamsInt64(":index"))
+	issue, err := issues_model.GetIssueByIndex(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64(":index"))
 	if err != nil {
-		if models.IsErrIssueNotExist(err) {
+		if issues_model.IsErrIssueNotExist(err) {
 			ctx.NotFound(err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "GetIssueByIndex", err)
@@ -332,8 +347,8 @@ func DeleteTime(ctx *context.APIContext) {
 		return
 	}
 
-	if !ctx.Repo.CanUseTimetracker(issue, ctx.User) {
-		if !ctx.Repo.Repository.IsTimetrackerEnabled() {
+	if !ctx.Repo.CanUseTimetracker(ctx, issue, ctx.Doer) {
+		if !ctx.Repo.Repository.IsTimetrackerEnabled(ctx) {
 			ctx.JSON(http.StatusBadRequest, struct{ Message string }{Message: "time tracking disabled"})
 			return
 		}
@@ -341,9 +356,9 @@ func DeleteTime(ctx *context.APIContext) {
 		return
 	}
 
-	time, err := models.GetTrackedTimeByID(ctx.ParamsInt64(":id"))
+	time, err := issues_model.GetTrackedTimeByID(ctx, ctx.PathParamInt64(":id"))
 	if err != nil {
-		if models.IsErrNotExist(err) {
+		if db.IsErrNotExist(err) {
 			ctx.NotFound(err)
 			return
 		}
@@ -355,13 +370,13 @@ func DeleteTime(ctx *context.APIContext) {
 		return
 	}
 
-	if !ctx.User.IsAdmin && time.UserID != ctx.User.ID {
-		//Only Admin and User itself can delete their time
+	if !ctx.Doer.IsAdmin && time.UserID != ctx.Doer.ID {
+		// Only Admin and User itself can delete their time
 		ctx.Status(http.StatusForbidden)
 		return
 	}
 
-	err = models.DeleteTime(time)
+	err = issues_model.DeleteTime(ctx, time)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "DeleteTime", err)
 		return
@@ -400,14 +415,16 @@ func ListTrackedTimesByUser(ctx *context.APIContext) {
 	//     "$ref": "#/responses/error"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
-	if !ctx.Repo.Repository.IsTimetrackerEnabled() {
+	if !ctx.Repo.Repository.IsTimetrackerEnabled(ctx) {
 		ctx.Error(http.StatusBadRequest, "", "time tracking disabled")
 		return
 	}
-	user, err := models.GetUserByName(ctx.Params(":timetrackingusername"))
+	user, err := user_model.GetUserByName(ctx, ctx.PathParam(":timetrackingusername"))
 	if err != nil {
-		if models.IsErrUserNotExist(err) {
+		if user_model.IsErrUserNotExist(err) {
 			ctx.NotFound(err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "GetUserByName", err)
@@ -419,26 +436,26 @@ func ListTrackedTimesByUser(ctx *context.APIContext) {
 		return
 	}
 
-	if !ctx.IsUserRepoAdmin() && !ctx.User.IsAdmin && ctx.User.ID != user.ID {
+	if !ctx.IsUserRepoAdmin() && !ctx.Doer.IsAdmin && ctx.Doer.ID != user.ID {
 		ctx.Error(http.StatusForbidden, "", fmt.Errorf("query by user not allowed; not enough rights"))
 		return
 	}
 
-	opts := models.FindTrackedTimesOptions{
+	opts := &issues_model.FindTrackedTimesOptions{
 		UserID:       user.ID,
 		RepositoryID: ctx.Repo.Repository.ID,
 	}
 
-	trackedTimes, err := models.GetTrackedTimes(opts)
+	trackedTimes, err := issues_model.GetTrackedTimes(ctx, opts)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "GetTrackedTimes", err)
 		return
 	}
-	if err = trackedTimes.LoadAttributes(); err != nil {
+	if err = trackedTimes.LoadAttributes(ctx); err != nil {
 		ctx.Error(http.StatusInternalServerError, "LoadAttributes", err)
 		return
 	}
-	ctx.JSON(http.StatusOK, convert.ToTrackedTimeList(trackedTimes))
+	ctx.JSON(http.StatusOK, convert.ToTrackedTimeList(ctx, ctx.Doer, trackedTimes))
 }
 
 // ListTrackedTimesByRepository lists all tracked times of the repository
@@ -488,22 +505,24 @@ func ListTrackedTimesByRepository(ctx *context.APIContext) {
 	//     "$ref": "#/responses/error"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
-	if !ctx.Repo.Repository.IsTimetrackerEnabled() {
+	if !ctx.Repo.Repository.IsTimetrackerEnabled(ctx) {
 		ctx.Error(http.StatusBadRequest, "", "time tracking disabled")
 		return
 	}
 
-	opts := models.FindTrackedTimesOptions{
+	opts := &issues_model.FindTrackedTimesOptions{
 		ListOptions:  utils.GetListOptions(ctx),
 		RepositoryID: ctx.Repo.Repository.ID,
 	}
 
 	// Filters
-	qUser := strings.Trim(ctx.Query("user"), " ")
+	qUser := ctx.FormTrim("user")
 	if qUser != "" {
-		user, err := models.GetUserByName(qUser)
-		if models.IsErrUserNotExist(err) {
+		user, err := user_model.GetUserByName(ctx, qUser)
+		if user_model.IsErrUserNotExist(err) {
 			ctx.Error(http.StatusNotFound, "User does not exist", err)
 		} else if err != nil {
 			ctx.Error(http.StatusInternalServerError, "GetUserByName", err)
@@ -513,34 +532,42 @@ func ListTrackedTimesByRepository(ctx *context.APIContext) {
 	}
 
 	var err error
-	if opts.CreatedBeforeUnix, opts.CreatedAfterUnix, err = utils.GetQueryBeforeSince(ctx); err != nil {
+	if opts.CreatedBeforeUnix, opts.CreatedAfterUnix, err = context.GetQueryBeforeSince(ctx.Base); err != nil {
 		ctx.Error(http.StatusUnprocessableEntity, "GetQueryBeforeSince", err)
 		return
 	}
 
-	cantSetUser := !ctx.User.IsAdmin &&
-		opts.UserID != ctx.User.ID &&
-		!ctx.IsUserRepoWriter([]models.UnitType{models.UnitTypeIssues})
+	cantSetUser := !ctx.Doer.IsAdmin &&
+		opts.UserID != ctx.Doer.ID &&
+		!ctx.IsUserRepoWriter([]unit.Type{unit.TypeIssues})
 
 	if cantSetUser {
 		if opts.UserID == 0 {
-			opts.UserID = ctx.User.ID
+			opts.UserID = ctx.Doer.ID
 		} else {
-			ctx.Error(http.StatusForbidden, "", fmt.Errorf("query user not allowed not enouth rights"))
+			ctx.Error(http.StatusForbidden, "", fmt.Errorf("query by user not allowed; not enough rights"))
 			return
 		}
 	}
 
-	trackedTimes, err := models.GetTrackedTimes(opts)
+	count, err := issues_model.CountTrackedTimes(ctx, opts)
+	if err != nil {
+		ctx.InternalServerError(err)
+		return
+	}
+
+	trackedTimes, err := issues_model.GetTrackedTimes(ctx, opts)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "GetTrackedTimes", err)
 		return
 	}
-	if err = trackedTimes.LoadAttributes(); err != nil {
+	if err = trackedTimes.LoadAttributes(ctx); err != nil {
 		ctx.Error(http.StatusInternalServerError, "LoadAttributes", err)
 		return
 	}
-	ctx.JSON(http.StatusOK, convert.ToTrackedTimeList(trackedTimes))
+
+	ctx.SetTotalCountHeader(count)
+	ctx.JSON(http.StatusOK, convert.ToTrackedTimeList(ctx, ctx.Doer, trackedTimes))
 }
 
 // ListMyTrackedTimes lists all tracked times of the current user
@@ -548,6 +575,8 @@ func ListMyTrackedTimes(ctx *context.APIContext) {
 	// swagger:operation GET /user/times user userCurrentTrackedTimes
 	// ---
 	// summary: List the current user's tracked times
+	// produces:
+	// - application/json
 	// parameters:
 	// - name: page
 	//   in: query
@@ -557,9 +586,6 @@ func ListMyTrackedTimes(ctx *context.APIContext) {
 	//   in: query
 	//   description: page size of results
 	//   type: integer
-	// produces:
-	// - application/json
-	// parameters:
 	// - name: since
 	//   in: query
 	//   description: Only show times updated after the given time. This is a timestamp in RFC 3339 format
@@ -574,27 +600,34 @@ func ListMyTrackedTimes(ctx *context.APIContext) {
 	//   "200":
 	//     "$ref": "#/responses/TrackedTimeList"
 
-	opts := models.FindTrackedTimesOptions{
+	opts := &issues_model.FindTrackedTimesOptions{
 		ListOptions: utils.GetListOptions(ctx),
-		UserID:      ctx.User.ID,
+		UserID:      ctx.Doer.ID,
 	}
 
 	var err error
-	if opts.CreatedBeforeUnix, opts.CreatedAfterUnix, err = utils.GetQueryBeforeSince(ctx); err != nil {
+	if opts.CreatedBeforeUnix, opts.CreatedAfterUnix, err = context.GetQueryBeforeSince(ctx.Base); err != nil {
 		ctx.Error(http.StatusUnprocessableEntity, "GetQueryBeforeSince", err)
 		return
 	}
 
-	trackedTimes, err := models.GetTrackedTimes(opts)
+	count, err := issues_model.CountTrackedTimes(ctx, opts)
+	if err != nil {
+		ctx.InternalServerError(err)
+		return
+	}
+
+	trackedTimes, err := issues_model.GetTrackedTimes(ctx, opts)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "GetTrackedTimesByUser", err)
 		return
 	}
 
-	if err = trackedTimes.LoadAttributes(); err != nil {
+	if err = trackedTimes.LoadAttributes(ctx); err != nil {
 		ctx.Error(http.StatusInternalServerError, "LoadAttributes", err)
 		return
 	}
 
-	ctx.JSON(http.StatusOK, convert.ToTrackedTimeList(trackedTimes))
+	ctx.SetTotalCountHeader(count)
+	ctx.JSON(http.StatusOK, convert.ToTrackedTimeList(ctx, ctx.Doer, trackedTimes))
 }

@@ -1,17 +1,16 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
-// +build gogit
+//go:build gogit
 
 package git
 
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 
 	"code.gitea.io/gitea/modules/analyze"
+	"code.gitea.io/gitea/modules/optional"
 
 	"github.com/go-enry/go-enry/v2"
 	"github.com/go-git/go-git/v5"
@@ -41,10 +40,72 @@ func (repo *Repository) GetLanguageStats(commitID string) (map[string]int64, err
 		return nil, err
 	}
 
+	checker, deferable := repo.CheckAttributeReader(commitID)
+	defer deferable()
+
+	// sizes contains the current calculated size of all files by language
 	sizes := make(map[string]int64)
+	// by default we will only count the sizes of programming languages or markup languages
+	// unless they are explicitly set using linguist-language
+	includedLanguage := map[string]bool{}
+	// or if there's only one language in the repository
+	firstExcludedLanguage := ""
+	firstExcludedLanguageSize := int64(0)
+
 	err = tree.Files().ForEach(func(f *object.File) error {
-		if f.Size == 0 || analyze.IsVendor(f.Name) || enry.IsDotFile(f.Name) ||
-			enry.IsDocumentation(f.Name) || enry.IsConfiguration(f.Name) {
+		if f.Size == 0 {
+			return nil
+		}
+
+		isVendored := optional.None[bool]()
+		isGenerated := optional.None[bool]()
+		isDocumentation := optional.None[bool]()
+		isDetectable := optional.None[bool]()
+
+		if checker != nil {
+			attrs, err := checker.CheckPath(f.Name)
+			if err == nil {
+				isVendored = AttributeToBool(attrs, AttributeLinguistVendored)
+				if isVendored.ValueOrDefault(false) {
+					return nil
+				}
+
+				isGenerated = AttributeToBool(attrs, AttributeLinguistGenerated)
+				if isGenerated.ValueOrDefault(false) {
+					return nil
+				}
+
+				isDocumentation = AttributeToBool(attrs, AttributeLinguistDocumentation)
+				if isDocumentation.ValueOrDefault(false) {
+					return nil
+				}
+
+				isDetectable = AttributeToBool(attrs, AttributeLinguistDetectable)
+				if !isDetectable.ValueOrDefault(true) {
+					return nil
+				}
+
+				hasLanguage := TryReadLanguageAttribute(attrs)
+				if hasLanguage.Value() != "" {
+					language := hasLanguage.Value()
+
+					// group languages, such as Pug -> HTML; SCSS -> CSS
+					group := enry.GetLanguageGroup(language)
+					if len(group) != 0 {
+						language = group
+					}
+
+					// this language will always be added to the size
+					sizes[language] += f.Size
+					return nil
+				}
+			}
+		}
+
+		if (!isVendored.Has() && analyze.IsVendor(f.Name)) ||
+			enry.IsDotFile(f.Name) ||
+			(!isDocumentation.Has() && enry.IsDocumentation(f.Name)) ||
+			enry.IsConfiguration(f.Name) {
 			return nil
 		}
 
@@ -53,11 +114,9 @@ func (repo *Repository) GetLanguageStats(commitID string) (map[string]int64, err
 		if f.Size <= bigFileSize {
 			content, _ = readFile(f, fileSizeLimit)
 		}
-		if enry.IsGenerated(f.Name, content) {
+		if !isGenerated.Has() && enry.IsGenerated(f.Name, content) {
 			return nil
 		}
-
-		// TODO: Use .gitattributes file for linguist overrides
 
 		language := analyze.GetCodeLanguage(f.Name, content)
 		if language == enry.OtherLanguage || language == "" {
@@ -70,7 +129,18 @@ func (repo *Repository) GetLanguageStats(commitID string) (map[string]int64, err
 			language = group
 		}
 
-		sizes[language] += f.Size
+		included, checked := includedLanguage[language]
+		if !checked {
+			langtype := enry.GetLanguageType(language)
+			included = langtype == enry.Programming || langtype == enry.Markup
+			includedLanguage[language] = included
+		}
+		if included || isDetectable.ValueOrDefault(false) {
+			sizes[language] += f.Size
+		} else if len(sizes) == 0 && (firstExcludedLanguage == "" || firstExcludedLanguage == language) {
+			firstExcludedLanguage = language
+			firstExcludedLanguageSize += f.Size
+		}
 
 		return nil
 	})
@@ -78,17 +148,12 @@ func (repo *Repository) GetLanguageStats(commitID string) (map[string]int64, err
 		return nil, err
 	}
 
-	// filter special languages unless they are the only language
-	if len(sizes) > 1 {
-		for language := range sizes {
-			langtype := enry.GetLanguageType(language)
-			if langtype != enry.Programming && langtype != enry.Markup {
-				delete(sizes, language)
-			}
-		}
+	// If there are no included languages add the first excluded language
+	if len(sizes) == 0 && firstExcludedLanguage != "" {
+		sizes[firstExcludedLanguage] = firstExcludedLanguageSize
 	}
 
-	return sizes, nil
+	return mergeLanguageStats(sizes), nil
 }
 
 func readFile(f *object.File, limit int64) ([]byte, error) {
@@ -99,7 +164,7 @@ func readFile(f *object.File, limit int64) ([]byte, error) {
 	defer r.Close()
 
 	if limit <= 0 {
-		return ioutil.ReadAll(r)
+		return io.ReadAll(r)
 	}
 
 	size := f.Size

@@ -1,6 +1,5 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package repo
 
@@ -8,12 +7,14 @@ import (
 	"errors"
 	"net/http"
 
-	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/convert"
+	issues_model "code.gitea.io/gitea/models/issues"
+	user_model "code.gitea.io/gitea/models/user"
 	api "code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/web"
 	"code.gitea.io/gitea/routers/api/v1/utils"
+	"code.gitea.io/gitea/services/context"
+	"code.gitea.io/gitea/services/convert"
+	issue_service "code.gitea.io/gitea/services/issue"
 )
 
 // GetIssueCommentReactions list reactions of a comment from an issue
@@ -47,10 +48,12 @@ func GetIssueCommentReactions(ctx *context.APIContext) {
 	//     "$ref": "#/responses/ReactionList"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
-	comment, err := models.GetCommentByID(ctx.ParamsInt64(":id"))
+	comment, err := issues_model.GetCommentByID(ctx, ctx.PathParamInt64(":id"))
 	if err != nil {
-		if models.IsErrCommentNotExist(err) {
+		if issues_model.IsErrCommentNotExist(err) {
 			ctx.NotFound(err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "GetCommentByID", err)
@@ -58,8 +61,14 @@ func GetIssueCommentReactions(ctx *context.APIContext) {
 		return
 	}
 
-	if err := comment.LoadIssue(); err != nil {
+	if err := comment.LoadIssue(ctx); err != nil {
 		ctx.Error(http.StatusInternalServerError, "comment.LoadIssue", err)
+		return
+	}
+
+	if comment.Issue.RepoID != ctx.Repo.Repository.ID {
+		ctx.NotFound()
+		return
 	}
 
 	if !ctx.Repo.CanReadIssuesOrPulls(comment.Issue.IsPull) {
@@ -67,12 +76,12 @@ func GetIssueCommentReactions(ctx *context.APIContext) {
 		return
 	}
 
-	reactions, err := models.FindCommentReactions(comment)
+	reactions, _, err := issues_model.FindCommentReactions(ctx, comment.IssueID, comment.ID)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "FindIssueReactions", err)
+		ctx.Error(http.StatusInternalServerError, "FindCommentReactions", err)
 		return
 	}
-	_, err = reactions.LoadUsers(ctx.Repo.Repository)
+	_, err = reactions.LoadUsers(ctx, ctx.Repo.Repository)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "ReactionList.LoadUsers()", err)
 		return
@@ -81,7 +90,7 @@ func GetIssueCommentReactions(ctx *context.APIContext) {
 	var result []api.Reaction
 	for _, r := range reactions {
 		result = append(result, api.Reaction{
-			User:     convert.ToUser(r.User, ctx.User),
+			User:     convert.ToUser(ctx, r.User, ctx.Doer),
 			Reaction: r.Type,
 			Created:  r.CreatedUnix.AsTime(),
 		})
@@ -127,6 +136,8 @@ func PostIssueCommentReaction(ctx *context.APIContext) {
 	//     "$ref": "#/responses/Reaction"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
 	form := web.GetForm(ctx).(*api.EditReactionOption)
 
@@ -168,6 +179,8 @@ func DeleteIssueCommentReaction(ctx *context.APIContext) {
 	//     "$ref": "#/responses/empty"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
 	form := web.GetForm(ctx).(*api.EditReactionOption)
 
@@ -175,9 +188,9 @@ func DeleteIssueCommentReaction(ctx *context.APIContext) {
 }
 
 func changeIssueCommentReaction(ctx *context.APIContext, form api.EditReactionOption, isCreateType bool) {
-	comment, err := models.GetCommentByID(ctx.ParamsInt64(":id"))
+	comment, err := issues_model.GetCommentByID(ctx, ctx.PathParamInt64(":id"))
 	if err != nil {
-		if models.IsErrCommentNotExist(err) {
+		if issues_model.IsErrCommentNotExist(err) {
 			ctx.NotFound(err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "GetCommentByID", err)
@@ -185,9 +198,19 @@ func changeIssueCommentReaction(ctx *context.APIContext, form api.EditReactionOp
 		return
 	}
 
-	err = comment.LoadIssue()
-	if err != nil {
+	if err = comment.LoadIssue(ctx); err != nil {
 		ctx.Error(http.StatusInternalServerError, "comment.LoadIssue() failed", err)
+		return
+	}
+
+	if comment.Issue.RepoID != ctx.Repo.Repository.ID {
+		ctx.NotFound()
+		return
+	}
+
+	if !ctx.Repo.CanReadIssuesOrPulls(comment.Issue.IsPull) {
+		ctx.NotFound()
+		return
 	}
 
 	if comment.Issue.IsLocked && !ctx.Repo.CanWriteIssuesOrPulls(comment.Issue.IsPull) {
@@ -197,13 +220,13 @@ func changeIssueCommentReaction(ctx *context.APIContext, form api.EditReactionOp
 
 	if isCreateType {
 		// PostIssueCommentReaction part
-		reaction, err := models.CreateCommentReaction(ctx.User, comment.Issue, comment, form.Reaction)
+		reaction, err := issue_service.CreateCommentReaction(ctx, ctx.Doer, comment, form.Reaction)
 		if err != nil {
-			if models.IsErrForbiddenIssueReaction(err) {
+			if issues_model.IsErrForbiddenIssueReaction(err) || errors.Is(err, user_model.ErrBlockedUser) {
 				ctx.Error(http.StatusForbidden, err.Error(), err)
-			} else if models.IsErrReactionAlreadyExist(err) {
+			} else if issues_model.IsErrReactionAlreadyExist(err) {
 				ctx.JSON(http.StatusOK, api.Reaction{
-					User:     convert.ToUser(ctx.User, ctx.User),
+					User:     convert.ToUser(ctx, ctx.Doer, ctx.Doer),
 					Reaction: reaction.Type,
 					Created:  reaction.CreatedUnix.AsTime(),
 				})
@@ -214,18 +237,18 @@ func changeIssueCommentReaction(ctx *context.APIContext, form api.EditReactionOp
 		}
 
 		ctx.JSON(http.StatusCreated, api.Reaction{
-			User:     convert.ToUser(ctx.User, ctx.User),
+			User:     convert.ToUser(ctx, ctx.Doer, ctx.Doer),
 			Reaction: reaction.Type,
 			Created:  reaction.CreatedUnix.AsTime(),
 		})
 	} else {
 		// DeleteIssueCommentReaction part
-		err = models.DeleteCommentReaction(ctx.User, comment.Issue, comment, form.Reaction)
+		err = issues_model.DeleteCommentReaction(ctx, ctx.Doer.ID, comment.Issue.ID, comment.ID, form.Reaction)
 		if err != nil {
 			ctx.Error(http.StatusInternalServerError, "DeleteCommentReaction", err)
 			return
 		}
-		//ToDo respond 204
+		// ToDo respond 204
 		ctx.Status(http.StatusOK)
 	}
 }
@@ -269,10 +292,12 @@ func GetIssueReactions(ctx *context.APIContext) {
 	//     "$ref": "#/responses/ReactionList"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 
-	issue, err := models.GetIssueWithAttrsByIndex(ctx.Repo.Repository.ID, ctx.ParamsInt64(":index"))
+	issue, err := issues_model.GetIssueWithAttrsByIndex(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64(":index"))
 	if err != nil {
-		if models.IsErrIssueNotExist(err) {
+		if issues_model.IsErrIssueNotExist(err) {
 			ctx.NotFound()
 		} else {
 			ctx.Error(http.StatusInternalServerError, "GetIssueByIndex", err)
@@ -285,12 +310,12 @@ func GetIssueReactions(ctx *context.APIContext) {
 		return
 	}
 
-	reactions, err := models.FindIssueReactions(issue, utils.GetListOptions(ctx))
+	reactions, count, err := issues_model.FindIssueReactions(ctx, issue.ID, utils.GetListOptions(ctx))
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "FindIssueReactions", err)
 		return
 	}
-	_, err = reactions.LoadUsers(ctx.Repo.Repository)
+	_, err = reactions.LoadUsers(ctx, ctx.Repo.Repository)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "ReactionList.LoadUsers()", err)
 		return
@@ -299,12 +324,13 @@ func GetIssueReactions(ctx *context.APIContext) {
 	var result []api.Reaction
 	for _, r := range reactions {
 		result = append(result, api.Reaction{
-			User:     convert.ToUser(r.User, ctx.User),
+			User:     convert.ToUser(ctx, r.User, ctx.Doer),
 			Reaction: r.Type,
 			Created:  r.CreatedUnix.AsTime(),
 		})
 	}
 
+	ctx.SetTotalCountHeader(count)
 	ctx.JSON(http.StatusOK, result)
 }
 
@@ -345,6 +371,8 @@ func PostIssueReaction(ctx *context.APIContext) {
 	//     "$ref": "#/responses/Reaction"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 	form := web.GetForm(ctx).(*api.EditReactionOption)
 	changeIssueReaction(ctx, *form, true)
 }
@@ -384,14 +412,16 @@ func DeleteIssueReaction(ctx *context.APIContext) {
 	//     "$ref": "#/responses/empty"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 	form := web.GetForm(ctx).(*api.EditReactionOption)
 	changeIssueReaction(ctx, *form, false)
 }
 
 func changeIssueReaction(ctx *context.APIContext, form api.EditReactionOption, isCreateType bool) {
-	issue, err := models.GetIssueWithAttrsByIndex(ctx.Repo.Repository.ID, ctx.ParamsInt64(":index"))
+	issue, err := issues_model.GetIssueWithAttrsByIndex(ctx, ctx.Repo.Repository.ID, ctx.PathParamInt64(":index"))
 	if err != nil {
-		if models.IsErrIssueNotExist(err) {
+		if issues_model.IsErrIssueNotExist(err) {
 			ctx.NotFound()
 		} else {
 			ctx.Error(http.StatusInternalServerError, "GetIssueByIndex", err)
@@ -406,35 +436,35 @@ func changeIssueReaction(ctx *context.APIContext, form api.EditReactionOption, i
 
 	if isCreateType {
 		// PostIssueReaction part
-		reaction, err := models.CreateIssueReaction(ctx.User, issue, form.Reaction)
+		reaction, err := issue_service.CreateIssueReaction(ctx, ctx.Doer, issue, form.Reaction)
 		if err != nil {
-			if models.IsErrForbiddenIssueReaction(err) {
+			if issues_model.IsErrForbiddenIssueReaction(err) || errors.Is(err, user_model.ErrBlockedUser) {
 				ctx.Error(http.StatusForbidden, err.Error(), err)
-			} else if models.IsErrReactionAlreadyExist(err) {
+			} else if issues_model.IsErrReactionAlreadyExist(err) {
 				ctx.JSON(http.StatusOK, api.Reaction{
-					User:     convert.ToUser(ctx.User, ctx.User),
+					User:     convert.ToUser(ctx, ctx.Doer, ctx.Doer),
 					Reaction: reaction.Type,
 					Created:  reaction.CreatedUnix.AsTime(),
 				})
 			} else {
-				ctx.Error(http.StatusInternalServerError, "CreateCommentReaction", err)
+				ctx.Error(http.StatusInternalServerError, "CreateIssueReaction", err)
 			}
 			return
 		}
 
 		ctx.JSON(http.StatusCreated, api.Reaction{
-			User:     convert.ToUser(ctx.User, ctx.User),
+			User:     convert.ToUser(ctx, ctx.Doer, ctx.Doer),
 			Reaction: reaction.Type,
 			Created:  reaction.CreatedUnix.AsTime(),
 		})
 	} else {
 		// DeleteIssueReaction part
-		err = models.DeleteIssueReaction(ctx.User, issue, form.Reaction)
+		err = issues_model.DeleteIssueReaction(ctx, ctx.Doer.ID, issue.ID, form.Reaction)
 		if err != nil {
 			ctx.Error(http.StatusInternalServerError, "DeleteIssueReaction", err)
 			return
 		}
-		//ToDo respond 204
+		// ToDo respond 204
 		ctx.Status(http.StatusOK)
 	}
 }

@@ -1,6 +1,5 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package references
 
@@ -51,7 +50,6 @@ owner/repo!123456789
 }
 
 func TestFindAllIssueReferences(t *testing.T) {
-
 	fixtures := []testFixture{
 		{
 			"Simply closes: #29 yes",
@@ -80,15 +78,15 @@ func TestFindAllIssueReferences(t *testing.T) {
 			[]testResult{},
 		},
 		{
-			"This user3/repo4#200 yes.",
+			"This org3/repo4#200 yes.",
 			[]testResult{
-				{200, "user3", "repo4", "200", false, XRefActionNone, &RefSpan{Start: 5, End: 20}, nil, ""},
+				{200, "org3", "repo4", "200", false, XRefActionNone, &RefSpan{Start: 5, End: 19}, nil, ""},
 			},
 		},
 		{
-			"This user3/repo4!200 yes.",
+			"This org3/repo4!200 yes.",
 			[]testResult{
-				{200, "user3", "repo4", "200", true, XRefActionNone, &RefSpan{Start: 5, End: 20}, nil, ""},
+				{200, "org3", "repo4", "200", true, XRefActionNone, &RefSpan{Start: 5, End: 19}, nil, ""},
 			},
 		},
 		{
@@ -108,13 +106,13 @@ func TestFindAllIssueReferences(t *testing.T) {
 			},
 		},
 		{
-			"This [four](http://gitea.com:3000/user3/repo4/issues/203) yes.",
+			"This [four](http://gitea.com:3000/org3/repo4/issues/203) yes.",
 			[]testResult{
-				{203, "user3", "repo4", "203", false, XRefActionNone, nil, nil, ""},
+				{203, "org3", "repo4", "203", false, XRefActionNone, nil, nil, ""},
 			},
 		},
 		{
-			"This [five](http://github.com/user3/repo4/issues/204) no.",
+			"This [five](http://github.com/org3/repo4/issues/204) no.",
 			[]testResult{},
 		},
 		{
@@ -153,9 +151,9 @@ func TestFindAllIssueReferences(t *testing.T) {
 			},
 		},
 		{
-			"Do you fix user6/repo6#300 ? yes",
+			"Do you fix org6/repo6#300 ? yes",
 			[]testResult{
-				{300, "user6", "repo6", "300", false, XRefActionCloses, &RefSpan{Start: 11, End: 26}, &RefSpan{Start: 7, End: 10}, ""},
+				{300, "org6", "repo6", "300", false, XRefActionCloses, &RefSpan{Start: 11, End: 25}, &RefSpan{Start: 7, End: 10}, ""},
 			},
 		},
 		{
@@ -192,9 +190,9 @@ func TestFindAllIssueReferences(t *testing.T) {
 			},
 		},
 		{
-			"This user3/repo4#200, yes.",
+			"This org3/repo4#200, yes.",
 			[]testResult{
-				{200, "user3", "repo4", "200", false, XRefActionNone, &RefSpan{Start: 5, End: 20}, nil, ""},
+				{200, "org3", "repo4", "200", false, XRefActionNone, &RefSpan{Start: 5, End: 19}, nil, ""},
 			},
 		},
 		{
@@ -305,12 +303,73 @@ func TestFindAllMentions(t *testing.T) {
 	}, res)
 }
 
+func TestFindRenderizableCommitCrossReference(t *testing.T) {
+	cases := []struct {
+		Input    string
+		Expected *RenderizableReference
+	}{
+		{
+			Input:    "",
+			Expected: nil,
+		},
+		{
+			Input:    "test",
+			Expected: nil,
+		},
+		{
+			Input:    "go-gitea/gitea@test",
+			Expected: nil,
+		},
+		{
+			Input:    "go-gitea/gitea@ab1234",
+			Expected: nil,
+		},
+		{
+			Input: "go-gitea/gitea@abcd1234",
+			Expected: &RenderizableReference{
+				Owner:       "go-gitea",
+				Name:        "gitea",
+				CommitSha:   "abcd1234",
+				RefLocation: &RefSpan{Start: 0, End: 23},
+			},
+		},
+		{
+			Input: "go-gitea/gitea@abcd1234abcd1234abcd1234abcd1234abcd1234",
+			Expected: &RenderizableReference{
+				Owner:       "go-gitea",
+				Name:        "gitea",
+				CommitSha:   "abcd1234abcd1234abcd1234abcd1234abcd1234",
+				RefLocation: &RefSpan{Start: 0, End: 55},
+			},
+		},
+		{
+			Input:    "go-gitea/gitea@abcd1234abcd1234abcd1234abcd1234abcd12341234512345123451234512345", // longer than 64 characters
+			Expected: nil,
+		},
+		{
+			Input: "test go-gitea/gitea@abcd1234 test",
+			Expected: &RenderizableReference{
+				Owner:       "go-gitea",
+				Name:        "gitea",
+				CommitSha:   "abcd1234",
+				RefLocation: &RefSpan{Start: 5, End: 28},
+			},
+		},
+	}
+
+	for _, c := range cases {
+		found, ref := FindRenderizableCommitCrossReference(c.Input)
+		assert.Equal(t, ref != nil, found)
+		assert.Equal(t, c.Expected, ref)
+	}
+}
+
 func TestRegExp_mentionPattern(t *testing.T) {
 	trueTestCases := []struct {
 		pat string
 		exp string
 	}{
-		{"@Unknwon", "@Unknwon"},
+		{"@User", "@User"},
 		{"@ANT_123", "@ANT_123"},
 		{"@xxx-DiN0-z-A..uru..s-xxx", "@xxx-DiN0-z-A..uru..s-xxx"},
 		{"   @lol   ", "@lol"},
@@ -333,6 +392,7 @@ func TestRegExp_mentionPattern(t *testing.T) {
 		{"@gitea,", "@gitea"},
 		{"@gitea;", "@gitea"},
 		{"@gitea/team1;", "@gitea/team1"},
+		{"@user's idea", "@user"},
 	}
 	falseTestCases := []string{
 		"@ 0",
@@ -353,7 +413,6 @@ func TestRegExp_mentionPattern(t *testing.T) {
 
 	for _, testCase := range trueTestCases {
 		found := mentionPattern.FindStringSubmatch(testCase.pat)
-		assert.Len(t, found, 2)
 		assert.Equal(t, testCase.exp, found[1])
 	}
 	for _, testCase := range falseTestCases {
@@ -370,6 +429,8 @@ func TestRegExp_issueNumericPattern(t *testing.T) {
 		"  #12",
 		"#12:",
 		"ref: #12: msg",
+		"\"#1234\"",
+		"'#1234'",
 	}
 	falseTestCases := []string{
 		"# 1234",
@@ -400,6 +461,8 @@ func TestRegExp_issueAlphanumericPattern(t *testing.T) {
 		"(ABC-123)",
 		"[ABC-123]",
 		"ABC-123:",
+		"\"ABC-123\"",
+		"'ABC-123'",
 	}
 	falseTestCases := []string{
 		"RC-08",
@@ -439,15 +502,15 @@ func TestCustomizeCloseKeywords(t *testing.T) {
 			},
 		},
 		{
-			"Cerró user6/repo6#300 yes",
+			"Cerró org6/repo6#300 yes",
 			[]testResult{
-				{300, "user6", "repo6", "300", false, XRefActionCloses, &RefSpan{Start: 7, End: 22}, &RefSpan{Start: 0, End: 6}, ""},
+				{300, "org6", "repo6", "300", false, XRefActionCloses, &RefSpan{Start: 7, End: 21}, &RefSpan{Start: 0, End: 6}, ""},
 			},
 		},
 		{
-			"Reabre user3/repo4#200 yes",
+			"Reabre org3/repo4#200 yes",
 			[]testResult{
-				{200, "user3", "repo4", "200", false, XRefActionReopens, &RefSpan{Start: 7, End: 22}, &RefSpan{Start: 0, End: 6}, ""},
+				{200, "org3", "repo4", "200", false, XRefActionReopens, &RefSpan{Start: 7, End: 21}, &RefSpan{Start: 0, End: 6}, ""},
 			},
 		},
 	}
@@ -481,7 +544,7 @@ func TestParseCloseKeywords(t *testing.T) {
 		{",$!", "", ""},
 		{"1234", "", ""},
 	} {
-		// The patern only needs to match the part that precedes the reference.
+		// The pattern only needs to match the part that precedes the reference.
 		// getCrossReference() takes care of finding the reference itself.
 		pat := makeKeywordsPat([]string{test.pattern})
 		if test.expected == "" {

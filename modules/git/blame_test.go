@@ -1,144 +1,146 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package git
 
 import (
 	"context"
-	"io/ioutil"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-const exampleBlame = `
-4b92a6c2df28054ad766bc262f308db9f6066596 1 1 1
-author Unknown
-author-mail <joe2010xtmf@163.com>
-author-time 1392833071
-author-tz -0500
-committer Unknown
-committer-mail <joe2010xtmf@163.com>
-committer-time 1392833071
-committer-tz -0500
-summary Add code of delete user
-previous be0ba9ea88aff8a658d0495d36accf944b74888d gogs.go
-filename gogs.go
-	// Copyright 2014 The Gogs Authors. All rights reserved.
-ce21ed6c3490cdfad797319cbb1145e2330a8fef 2 2 1
-author Joubert RedRat
-author-mail <eu+github@redrat.com.br>
-author-time 1482322397
-author-tz -0200
-committer Lunny Xiao
-committer-mail <xiaolunwen@gmail.com>
-committer-time 1482322397
-committer-tz +0800
-summary Remove remaining Gogs reference on locales and cmd (#430)
-previous 618407c018cdf668ceedde7454c42fb22ba422d8 main.go
-filename main.go
-	// Copyright 2016 The Gitea Authors. All rights reserved.
-4b92a6c2df28054ad766bc262f308db9f6066596 2 3 2
-author Unknown
-author-mail <joe2010xtmf@163.com>
-author-time 1392833071
-author-tz -0500
-committer Unknown
-committer-mail <joe2010xtmf@163.com>
-committer-time 1392833071
-committer-tz -0500
-summary Add code of delete user
-previous be0ba9ea88aff8a658d0495d36accf944b74888d gogs.go
-filename gogs.go
-	// Use of this source code is governed by a MIT-style
-4b92a6c2df28054ad766bc262f308db9f6066596 3 4
-author Unknown
-author-mail <joe2010xtmf@163.com>
-author-time 1392833071
-author-tz -0500
-committer Unknown
-committer-mail <joe2010xtmf@163.com>
-committer-time 1392833071
-committer-tz -0500
-summary Add code of delete user
-previous be0ba9ea88aff8a658d0495d36accf944b74888d gogs.go
-filename gogs.go
-	// license that can be found in the LICENSE file.
-	
-e2aa991e10ffd924a828ec149951f2f20eecead2 6 6 2
-author Lunny Xiao
-author-mail <xiaolunwen@gmail.com>
-author-time 1478872595
-author-tz +0800
-committer Sandro Santilli
-committer-mail <strk@kbt.io>
-committer-time 1478872595
-committer-tz +0100
-summary ask for go get from code.gitea.io/gitea and change gogs to gitea on main file (#146)
-previous 5fc370e332171b8658caed771b48585576f11737 main.go
-filename main.go
-	// Gitea (git with a cup of tea) is a painless self-hosted Git Service.
-e2aa991e10ffd924a828ec149951f2f20eecead2 7 7
-	package main // import "code.gitea.io/gitea"
-`
-
 func TestReadingBlameOutput(t *testing.T) {
-	tempFile, err := ioutil.TempFile("", ".txt")
-	if err != nil {
-		panic(err)
-	}
-
-	defer tempFile.Close()
-
-	if _, err = tempFile.WriteString(exampleBlame); err != nil {
-		panic(err)
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	blameReader, err := createBlameReader(ctx, "", "cat", tempFile.Name())
-	if err != nil {
-		panic(err)
-	}
-	defer blameReader.Close()
+	t.Run("Without .git-blame-ignore-revs", func(t *testing.T) {
+		repo, err := OpenRepository(ctx, "./tests/repos/repo5_pulls")
+		assert.NoError(t, err)
+		defer repo.Close()
 
-	parts := []*BlamePart{
-		{
-			"4b92a6c2df28054ad766bc262f308db9f6066596",
-			[]string{
-				"// Copyright 2014 The Gogs Authors. All rights reserved.",
-			},
-		},
-		{
-			"ce21ed6c3490cdfad797319cbb1145e2330a8fef",
-			[]string{
-				"// Copyright 2016 The Gitea Authors. All rights reserved.",
-			},
-		},
-		{
-			"4b92a6c2df28054ad766bc262f308db9f6066596",
-			[]string{
-				"// Use of this source code is governed by a MIT-style",
-				"// license that can be found in the LICENSE file.",
-				"",
-			},
-		},
-		{
-			"e2aa991e10ffd924a828ec149951f2f20eecead2",
-			[]string{
-				"// Gitea (git with a cup of tea) is a painless self-hosted Git Service.",
-				"package main // import \"code.gitea.io/gitea\"",
-			},
-		},
-		nil,
-	}
+		commit, err := repo.GetCommit("f32b0a9dfd09a60f616f29158f772cedd89942d2")
+		assert.NoError(t, err)
 
-	for _, part := range parts {
-		actualPart, err := blameReader.NextPart()
-		if err != nil {
-			panic(err)
+		parts := []*BlamePart{
+			{
+				Sha: "72866af952e98d02a73003501836074b286a78f6",
+				Lines: []string{
+					"# test_repo",
+					"Test repository for testing migration from github to gitea",
+				},
+			},
+			{
+				Sha:          "f32b0a9dfd09a60f616f29158f772cedd89942d2",
+				Lines:        []string{"", "Do not make any changes to this repo it is used for unit testing"},
+				PreviousSha:  "72866af952e98d02a73003501836074b286a78f6",
+				PreviousPath: "README.md",
+			},
 		}
-		assert.Equal(t, part, actualPart)
-	}
+
+		for _, bypass := range []bool{false, true} {
+			blameReader, err := CreateBlameReader(ctx, Sha1ObjectFormat, "./tests/repos/repo5_pulls", commit, "README.md", bypass)
+			assert.NoError(t, err)
+			assert.NotNil(t, blameReader)
+			defer blameReader.Close()
+
+			assert.False(t, blameReader.UsesIgnoreRevs())
+
+			for _, part := range parts {
+				actualPart, err := blameReader.NextPart()
+				assert.NoError(t, err)
+				assert.Equal(t, part, actualPart)
+			}
+
+			// make sure all parts have been read
+			actualPart, err := blameReader.NextPart()
+			assert.Nil(t, actualPart)
+			assert.NoError(t, err)
+		}
+	})
+
+	t.Run("With .git-blame-ignore-revs", func(t *testing.T) {
+		repo, err := OpenRepository(ctx, "./tests/repos/repo6_blame")
+		assert.NoError(t, err)
+		defer repo.Close()
+
+		full := []*BlamePart{
+			{
+				Sha:   "af7486bd54cfc39eea97207ca666aa69c9d6df93",
+				Lines: []string{"line", "line"},
+			},
+			{
+				Sha:          "45fb6cbc12f970b04eacd5cd4165edd11c8d7376",
+				Lines:        []string{"changed line"},
+				PreviousSha:  "af7486bd54cfc39eea97207ca666aa69c9d6df93",
+				PreviousPath: "blame.txt",
+			},
+			{
+				Sha:   "af7486bd54cfc39eea97207ca666aa69c9d6df93",
+				Lines: []string{"line", "line", ""},
+			},
+		}
+
+		cases := []struct {
+			CommitID       string
+			UsesIgnoreRevs bool
+			Bypass         bool
+			Parts          []*BlamePart
+		}{
+			{
+				CommitID:       "544d8f7a3b15927cddf2299b4b562d6ebd71b6a7",
+				UsesIgnoreRevs: true,
+				Bypass:         false,
+				Parts: []*BlamePart{
+					{
+						Sha:   "af7486bd54cfc39eea97207ca666aa69c9d6df93",
+						Lines: []string{"line", "line", "changed line", "line", "line", ""},
+					},
+				},
+			},
+			{
+				CommitID:       "544d8f7a3b15927cddf2299b4b562d6ebd71b6a7",
+				UsesIgnoreRevs: false,
+				Bypass:         true,
+				Parts:          full,
+			},
+			{
+				CommitID:       "45fb6cbc12f970b04eacd5cd4165edd11c8d7376",
+				UsesIgnoreRevs: false,
+				Bypass:         false,
+				Parts:          full,
+			},
+			{
+				CommitID:       "45fb6cbc12f970b04eacd5cd4165edd11c8d7376",
+				UsesIgnoreRevs: false,
+				Bypass:         false,
+				Parts:          full,
+			},
+		}
+
+		objectFormat, err := repo.GetObjectFormat()
+		assert.NoError(t, err)
+		for _, c := range cases {
+			commit, err := repo.GetCommit(c.CommitID)
+			assert.NoError(t, err)
+
+			blameReader, err := CreateBlameReader(ctx, objectFormat, "./tests/repos/repo6_blame", commit, "blame.txt", c.Bypass)
+			assert.NoError(t, err)
+			assert.NotNil(t, blameReader)
+			defer blameReader.Close()
+
+			assert.Equal(t, c.UsesIgnoreRevs, blameReader.UsesIgnoreRevs())
+
+			for _, part := range c.Parts {
+				actualPart, err := blameReader.NextPart()
+				assert.NoError(t, err)
+				assert.Equal(t, part, actualPart)
+			}
+
+			// make sure all parts have been read
+			actualPart, err := blameReader.NextPart()
+			assert.Nil(t, actualPart)
+			assert.NoError(t, err)
+		}
+	})
 }

@@ -1,33 +1,37 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package models
 
 import (
+	"context"
 	"fmt"
 	"strings"
+
+	"code.gitea.io/gitea/models/db"
+	access_model "code.gitea.io/gitea/models/perm/access"
+	repo_model "code.gitea.io/gitea/models/repo"
 )
 
 // GetYamlFixturesAccess returns a string containing the contents
 // for the access table, as recalculated using repo.RecalculateAccesses()
-func GetYamlFixturesAccess() (string, error) {
-	repos := make([]*Repository, 0, 50)
-	if err := x.Find(&repos); err != nil {
+func GetYamlFixturesAccess(ctx context.Context) (string, error) {
+	repos := make([]*repo_model.Repository, 0, 50)
+	if err := db.GetEngine(ctx).Find(&repos); err != nil {
 		return "", err
 	}
 
 	for _, repo := range repos {
-		repo.MustOwner()
-		if err := repo.RecalculateAccesses(); err != nil {
+		repo.MustOwner(ctx)
+		if err := access_model.RecalculateAccesses(ctx, repo); err != nil {
 			return "", err
 		}
 	}
 
 	var b strings.Builder
 
-	accesses := make([]*Access, 0, 200)
-	if err := x.OrderBy("user_id, repo_id").Find(&accesses); err != nil {
+	accesses := make([]*access_model.Access, 0, 200)
+	if err := db.GetEngine(ctx).OrderBy("user_id, repo_id").Find(&accesses); err != nil {
 		return "", err
 	}
 
@@ -37,7 +41,9 @@ func GetYamlFixturesAccess() (string, error) {
 		fmt.Fprintf(&b, "  user_id: %d\n", a.UserID)
 		fmt.Fprintf(&b, "  repo_id: %d\n", a.RepoID)
 		fmt.Fprintf(&b, "  mode: %d\n", a.Mode)
-		fmt.Fprintf(&b, "\n")
+		if i < len(accesses)-1 {
+			fmt.Fprintf(&b, "\n")
+		}
 	}
 
 	return b.String(), nil

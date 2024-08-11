@@ -1,6 +1,5 @@
 // Copyright 2021 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package lfs
 
@@ -29,10 +28,10 @@ const (
 
 var (
 	// ErrMissingPrefix occurs if the content lacks the LFS prefix
-	ErrMissingPrefix = errors.New("Content lacks the LFS prefix")
+	ErrMissingPrefix = errors.New("content lacks the LFS prefix")
 
 	// ErrInvalidStructure occurs if the content has an invalid structure
-	ErrInvalidStructure = errors.New("Content has an invalid structure")
+	ErrInvalidStructure = errors.New("content has an invalid structure")
 
 	// ErrInvalidOIDFormat occurs if the oid has an invalid format
 	ErrInvalidOIDFormat = errors.New("OID has an invalid format")
@@ -109,6 +108,13 @@ func (p Pointer) RelativePath() string {
 	}
 
 	return path.Join(p.Oid[0:2], p.Oid[2:4], p.Oid[4:])
+}
+
+func (p Pointer) LogString() string {
+	if p.Oid == "" && p.Size == 0 {
+		return "<LFSPointer empty>"
+	}
+	return fmt.Sprintf("<LFSPointer %s:%d>", p.Oid, p.Size)
 }
 
 // GeneratePointer generates a pointer for arbitrary content

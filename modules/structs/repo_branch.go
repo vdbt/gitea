@@ -1,6 +1,5 @@
 // Copyright 2016 The Gogs Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package structs
 
@@ -23,12 +22,19 @@ type Branch struct {
 
 // BranchProtection represents a branch protection for a repository
 type BranchProtection struct {
+	// Deprecated: true
 	BranchName                    string   `json:"branch_name"`
+	RuleName                      string   `json:"rule_name"`
 	EnablePush                    bool     `json:"enable_push"`
 	EnablePushWhitelist           bool     `json:"enable_push_whitelist"`
 	PushWhitelistUsernames        []string `json:"push_whitelist_usernames"`
 	PushWhitelistTeams            []string `json:"push_whitelist_teams"`
 	PushWhitelistDeployKeys       bool     `json:"push_whitelist_deploy_keys"`
+	EnableForcePush               bool     `json:"enable_force_push"`
+	EnableForcePushAllowlist      bool     `json:"enable_force_push_allowlist"`
+	ForcePushAllowlistUsernames   []string `json:"force_push_allowlist_usernames"`
+	ForcePushAllowlistTeams       []string `json:"force_push_allowlist_teams"`
+	ForcePushAllowlistDeployKeys  bool     `json:"force_push_allowlist_deploy_keys"`
 	EnableMergeWhitelist          bool     `json:"enable_merge_whitelist"`
 	MergeWhitelistUsernames       []string `json:"merge_whitelist_usernames"`
 	MergeWhitelistTeams           []string `json:"merge_whitelist_teams"`
@@ -42,8 +48,10 @@ type BranchProtection struct {
 	BlockOnOfficialReviewRequests bool     `json:"block_on_official_review_requests"`
 	BlockOnOutdatedBranch         bool     `json:"block_on_outdated_branch"`
 	DismissStaleApprovals         bool     `json:"dismiss_stale_approvals"`
+	IgnoreStaleApprovals          bool     `json:"ignore_stale_approvals"`
 	RequireSignedCommits          bool     `json:"require_signed_commits"`
 	ProtectedFilePatterns         string   `json:"protected_file_patterns"`
+	UnprotectedFilePatterns       string   `json:"unprotected_file_patterns"`
 	// swagger:strfmt date-time
 	Created time.Time `json:"created_at"`
 	// swagger:strfmt date-time
@@ -52,12 +60,19 @@ type BranchProtection struct {
 
 // CreateBranchProtectionOption options for creating a branch protection
 type CreateBranchProtectionOption struct {
+	// Deprecated: true
 	BranchName                    string   `json:"branch_name"`
+	RuleName                      string   `json:"rule_name"`
 	EnablePush                    bool     `json:"enable_push"`
 	EnablePushWhitelist           bool     `json:"enable_push_whitelist"`
 	PushWhitelistUsernames        []string `json:"push_whitelist_usernames"`
 	PushWhitelistTeams            []string `json:"push_whitelist_teams"`
 	PushWhitelistDeployKeys       bool     `json:"push_whitelist_deploy_keys"`
+	EnableForcePush               bool     `json:"enable_force_push"`
+	EnableForcePushAllowlist      bool     `json:"enable_force_push_allowlist"`
+	ForcePushAllowlistUsernames   []string `json:"force_push_allowlist_usernames"`
+	ForcePushAllowlistTeams       []string `json:"force_push_allowlist_teams"`
+	ForcePushAllowlistDeployKeys  bool     `json:"force_push_allowlist_deploy_keys"`
 	EnableMergeWhitelist          bool     `json:"enable_merge_whitelist"`
 	MergeWhitelistUsernames       []string `json:"merge_whitelist_usernames"`
 	MergeWhitelistTeams           []string `json:"merge_whitelist_teams"`
@@ -71,8 +86,10 @@ type CreateBranchProtectionOption struct {
 	BlockOnOfficialReviewRequests bool     `json:"block_on_official_review_requests"`
 	BlockOnOutdatedBranch         bool     `json:"block_on_outdated_branch"`
 	DismissStaleApprovals         bool     `json:"dismiss_stale_approvals"`
+	IgnoreStaleApprovals          bool     `json:"ignore_stale_approvals"`
 	RequireSignedCommits          bool     `json:"require_signed_commits"`
 	ProtectedFilePatterns         string   `json:"protected_file_patterns"`
+	UnprotectedFilePatterns       string   `json:"unprotected_file_patterns"`
 }
 
 // EditBranchProtectionOption options for editing a branch protection
@@ -82,6 +99,11 @@ type EditBranchProtectionOption struct {
 	PushWhitelistUsernames        []string `json:"push_whitelist_usernames"`
 	PushWhitelistTeams            []string `json:"push_whitelist_teams"`
 	PushWhitelistDeployKeys       *bool    `json:"push_whitelist_deploy_keys"`
+	EnableForcePush               *bool    `json:"enable_force_push"`
+	EnableForcePushAllowlist      *bool    `json:"enable_force_push_allowlist"`
+	ForcePushAllowlistUsernames   []string `json:"force_push_allowlist_usernames"`
+	ForcePushAllowlistTeams       []string `json:"force_push_allowlist_teams"`
+	ForcePushAllowlistDeployKeys  *bool    `json:"force_push_allowlist_deploy_keys"`
 	EnableMergeWhitelist          *bool    `json:"enable_merge_whitelist"`
 	MergeWhitelistUsernames       []string `json:"merge_whitelist_usernames"`
 	MergeWhitelistTeams           []string `json:"merge_whitelist_teams"`
@@ -95,6 +117,8 @@ type EditBranchProtectionOption struct {
 	BlockOnOfficialReviewRequests *bool    `json:"block_on_official_review_requests"`
 	BlockOnOutdatedBranch         *bool    `json:"block_on_outdated_branch"`
 	DismissStaleApprovals         *bool    `json:"dismiss_stale_approvals"`
+	IgnoreStaleApprovals          *bool    `json:"ignore_stale_approvals"`
 	RequireSignedCommits          *bool    `json:"require_signed_commits"`
 	ProtectedFilePatterns         *string  `json:"protected_file_patterns"`
+	UnprotectedFilePatterns       *string  `json:"unprotected_file_patterns"`
 }

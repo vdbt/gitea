@@ -1,16 +1,17 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
+//nolint:forbidigo
 package main
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
 	"code.gitea.io/gitea/models"
+	"code.gitea.io/gitea/models/unittest"
 )
 
 // To generate derivative fixtures, execute the following from Gitea's repository base dir:
@@ -18,7 +19,7 @@ import (
 
 var (
 	generators = []struct {
-		gen  func() (string, error)
+		gen  func(ctx context.Context) (string, error)
 		name string
 	}{
 		{
@@ -31,24 +32,27 @@ var (
 func main() {
 	pathToGiteaRoot := "."
 	fixturesDir = filepath.Join(pathToGiteaRoot, "models", "fixtures")
-	if err := models.CreateTestEngine(fixturesDir); err != nil {
+	if err := unittest.CreateTestEngine(unittest.FixturesOptions{
+		Dir: fixturesDir,
+	}); err != nil {
 		fmt.Printf("CreateTestEngine: %+v", err)
 		os.Exit(1)
 	}
-	if err := models.PrepareTestDatabase(); err != nil {
+	if err := unittest.PrepareTestDatabase(); err != nil {
 		fmt.Printf("PrepareTestDatabase: %+v\n", err)
 		os.Exit(1)
 	}
+	ctx := context.Background()
 	if len(os.Args) == 0 {
 		for _, r := range os.Args {
-			if err := generate(r); err != nil {
+			if err := generate(ctx, r); err != nil {
 				fmt.Printf("generate '%s': %+v\n", r, err)
 				os.Exit(1)
 			}
 		}
 	} else {
 		for _, g := range generators {
-			if err := generate(g.name); err != nil {
+			if err := generate(ctx, g.name); err != nil {
 				fmt.Printf("generate '%s': %+v\n", g.name, err)
 				os.Exit(1)
 			}
@@ -56,15 +60,15 @@ func main() {
 	}
 }
 
-func generate(name string) error {
+func generate(ctx context.Context, name string) error {
 	for _, g := range generators {
 		if g.name == name {
-			data, err := g.gen()
+			data, err := g.gen(ctx)
 			if err != nil {
 				return err
 			}
 			path := filepath.Join(fixturesDir, name+".yml")
-			if err := ioutil.WriteFile(path, []byte(data), 0644); err != nil {
+			if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 				return fmt.Errorf("%s: %+v", path, err)
 			}
 			fmt.Printf("%s created.\n", path)

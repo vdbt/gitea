@@ -1,8 +1,7 @@
 // Copyright 2018 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
-// +build gogit
+//go:build gogit
 
 package git
 
@@ -12,7 +11,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
+	"github.com/go-git/go-git/v5/plumbing/hash"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
@@ -51,15 +52,16 @@ func parseTreeEntries(data []byte, ptree *Tree) ([]*TreeEntry, error) {
 			return nil, fmt.Errorf("unknown type: %v", string(data[pos:pos+6]))
 		}
 
-		if pos+40 > len(data) {
+		// in hex format, not byte format ....
+		if pos+hash.Size*2 > len(data) {
 			return nil, fmt.Errorf("Invalid ls-tree output: %s", string(data))
 		}
-		id, err := NewIDFromString(string(data[pos : pos+40]))
+		var err error
+		entry.ID, err = NewIDFromString(string(data[pos : pos+hash.Size*2]))
 		if err != nil {
-			return nil, fmt.Errorf("Invalid ls-tree output: %v", err)
+			return nil, fmt.Errorf("invalid ls-tree output: %w", err)
 		}
-		entry.ID = id
-		entry.gogitTreeEntry.Hash = id
+		entry.gogitTreeEntry.Hash = plumbing.Hash(entry.ID.RawValue())
 		pos += 41 // skip over sha and trailing space
 
 		end := pos + bytes.IndexByte(data[pos:], '\t')
@@ -78,9 +80,10 @@ func parseTreeEntries(data []byte, ptree *Tree) ([]*TreeEntry, error) {
 
 		// In case entry name is surrounded by double quotes(it happens only in git-shell).
 		if data[pos] == '"' {
+			var err error
 			entry.gogitTreeEntry.Name, err = strconv.Unquote(string(data[pos:end]))
 			if err != nil {
-				return nil, fmt.Errorf("Invalid ls-tree output: %v", err)
+				return nil, fmt.Errorf("Invalid ls-tree output: %w", err)
 			}
 		} else {
 			entry.gogitTreeEntry.Name = string(data[pos:end])

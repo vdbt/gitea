@@ -1,35 +1,73 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package release
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 
 	"code.gitea.io/gitea/models"
+	"code.gitea.io/gitea/models/db"
+	git_model "code.gitea.io/gitea/models/git"
+	repo_model "code.gitea.io/gitea/models/repo"
+	user_model "code.gitea.io/gitea/models/user"
+	"code.gitea.io/gitea/modules/container"
 	"code.gitea.io/gitea/modules/git"
+	"code.gitea.io/gitea/modules/gitrepo"
+	"code.gitea.io/gitea/modules/graceful"
 	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/notification"
 	"code.gitea.io/gitea/modules/repository"
 	"code.gitea.io/gitea/modules/storage"
 	"code.gitea.io/gitea/modules/timeutil"
+	"code.gitea.io/gitea/modules/util"
+	notify_service "code.gitea.io/gitea/services/notify"
 )
 
-func createTag(gitRepo *git.Repository, rel *models.Release, msg string) (bool, error) {
+func createTag(ctx context.Context, gitRepo *git.Repository, rel *repo_model.Release, msg string) (bool, error) {
+	err := rel.LoadAttributes(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	err = rel.Repo.MustNotBeArchived()
+	if err != nil {
+		return false, err
+	}
+
 	var created bool
 	// Only actual create when publish.
 	if !rel.IsDraft {
 		if !gitRepo.IsTagExist(rel.TagName) {
-			commit, err := gitRepo.GetCommit(rel.Target)
+			if err := rel.LoadAttributes(ctx); err != nil {
+				log.Error("LoadAttributes: %v", err)
+				return false, err
+			}
+
+			protectedTags, err := git_model.GetProtectedTags(ctx, rel.Repo.ID)
 			if err != nil {
-				return false, fmt.Errorf("GetCommit: %v", err)
+				return false, fmt.Errorf("GetProtectedTags: %w", err)
 			}
 
 			// Trim '--' prefix to prevent command line argument vulnerability.
 			rel.TagName = strings.TrimPrefix(rel.TagName, "--")
+			isAllowed, err := git_model.IsUserAllowedToControlTag(ctx, protectedTags, rel.TagName, rel.PublisherID)
+			if err != nil {
+				return false, err
+			}
+			if !isAllowed {
+				return false, models.ErrProtectedTagName{
+					TagName: rel.TagName,
+				}
+			}
+
+			commit, err := gitRepo.GetCommit(rel.Target)
+			if err != nil {
+				return false, fmt.Errorf("createTag::GetCommit[%v]: %w", rel.Target, err)
+			}
+
 			if len(msg) > 0 {
 				if err = gitRepo.CreateAnnotatedTag(rel.TagName, msg, commit.ID.String()); err != nil {
 					if strings.Contains(err.Error(), "is not a valid tag name") {
@@ -49,34 +87,36 @@ func createTag(gitRepo *git.Repository, rel *models.Release, msg string) (bool, 
 			}
 			created = true
 			rel.LowerTagName = strings.ToLower(rel.TagName)
-			// Prepare Notify
-			if err := rel.LoadAttributes(); err != nil {
-				log.Error("LoadAttributes: %v", err)
-				return false, err
-			}
-			notification.NotifyPushCommits(
-				rel.Publisher, rel.Repo,
+
+			objectFormat := git.ObjectFormatFromName(rel.Repo.ObjectFormatName)
+			commits := repository.NewPushCommits()
+			commits.HeadCommit = repository.CommitToPushCommit(commit)
+			commits.CompareURL = rel.Repo.ComposeCompareURL(objectFormat.EmptyObjectID().String(), commit.ID.String())
+
+			refFullName := git.RefNameFromTag(rel.TagName)
+			notify_service.PushCommits(
+				ctx, rel.Publisher, rel.Repo,
 				&repository.PushUpdateOptions{
-					RefFullName: git.TagPrefix + rel.TagName,
-					OldCommitID: git.EmptySHA,
+					RefFullName: refFullName,
+					OldCommitID: objectFormat.EmptyObjectID().String(),
 					NewCommitID: commit.ID.String(),
-				}, repository.NewPushCommits())
-			notification.NotifyCreateRef(rel.Publisher, rel.Repo, "tag", git.TagPrefix+rel.TagName)
+				}, commits)
+			notify_service.CreateRef(ctx, rel.Publisher, rel.Repo, refFullName, commit.ID.String())
 			rel.CreatedUnix = timeutil.TimeStampNow()
 		}
 		commit, err := gitRepo.GetTagCommit(rel.TagName)
 		if err != nil {
-			return false, fmt.Errorf("GetTagCommit: %v", err)
+			return false, fmt.Errorf("GetTagCommit: %w", err)
 		}
 
 		rel.Sha1 = commit.ID.String()
 		rel.NumCommits, err = commit.CommitsCount()
 		if err != nil {
-			return false, fmt.Errorf("CommitsCount: %v", err)
+			return false, fmt.Errorf("CommitsCount: %w", err)
 		}
 
 		if rel.PublisherID <= 0 {
-			u, err := models.GetUserByEmail(commit.Author.Email)
+			u, err := user_model.GetUserByEmail(ctx, commit.Author.Email)
 			if err == nil {
 				rel.PublisherID = u.ID
 			}
@@ -88,56 +128,58 @@ func createTag(gitRepo *git.Repository, rel *models.Release, msg string) (bool, 
 }
 
 // CreateRelease creates a new release of repository.
-func CreateRelease(gitRepo *git.Repository, rel *models.Release, attachmentUUIDs []string, msg string) error {
-	isExist, err := models.IsReleaseExist(rel.RepoID, rel.TagName)
+func CreateRelease(gitRepo *git.Repository, rel *repo_model.Release, attachmentUUIDs []string, msg string) error {
+	has, err := repo_model.IsReleaseExist(gitRepo.Ctx, rel.RepoID, rel.TagName)
 	if err != nil {
 		return err
-	} else if isExist {
-		return models.ErrReleaseAlreadyExist{
+	} else if has {
+		return repo_model.ErrReleaseAlreadyExist{
 			TagName: rel.TagName,
 		}
 	}
 
-	if _, err = createTag(gitRepo, rel, msg); err != nil {
+	if _, err = createTag(gitRepo.Ctx, gitRepo, rel, msg); err != nil {
 		return err
 	}
 
 	rel.LowerTagName = strings.ToLower(rel.TagName)
-	if err = models.InsertRelease(rel); err != nil {
+	if err = db.Insert(gitRepo.Ctx, rel); err != nil {
 		return err
 	}
 
-	if err = models.AddReleaseAttachments(models.DefaultDBContext(), rel.ID, attachmentUUIDs); err != nil {
+	if err = repo_model.AddReleaseAttachments(gitRepo.Ctx, rel.ID, attachmentUUIDs); err != nil {
 		return err
 	}
 
 	if !rel.IsDraft {
-		notification.NotifyNewRelease(rel)
+		notify_service.NewRelease(gitRepo.Ctx, rel)
 	}
 
 	return nil
 }
 
 // CreateNewTag creates a new repository tag
-func CreateNewTag(doer *models.User, repo *models.Repository, commit, tagName, msg string) error {
-	isExist, err := models.IsReleaseExist(repo.ID, tagName)
+func CreateNewTag(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, commit, tagName, msg string) error {
+	has, err := repo_model.IsReleaseExist(ctx, repo.ID, tagName)
 	if err != nil {
 		return err
-	} else if isExist {
+	} else if has {
 		return models.ErrTagAlreadyExists{
 			TagName: tagName,
 		}
 	}
 
-	gitRepo, err := git.OpenRepository(repo.RepoPath())
+	gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, repo)
 	if err != nil {
 		return err
 	}
-	defer gitRepo.Close()
+	defer closer.Close()
 
-	rel := &models.Release{
+	rel := &repo_model.Release{
 		RepoID:       repo.ID,
+		Repo:         repo,
 		PublisherID:  doer.ID,
+		Publisher:    doer,
 		TagName:      tagName,
 		Target:       commit,
 		IsDraft:      false,
@@ -145,84 +187,93 @@ func CreateNewTag(doer *models.User, repo *models.Repository, commit, tagName, m
 		IsTag:        true,
 	}
 
-	if _, err = createTag(gitRepo, rel, msg); err != nil {
+	if _, err = createTag(ctx, gitRepo, rel, msg); err != nil {
 		return err
 	}
 
-	if err = models.InsertRelease(rel); err != nil {
-		return err
-	}
-
-	return err
+	return db.Insert(ctx, rel)
 }
 
 // UpdateRelease updates information, attachments of a release and will create tag if it's not a draft and tag not exist.
 // addAttachmentUUIDs accept a slice of new created attachments' uuids which will be reassigned release_id as the created release
 // delAttachmentUUIDs accept a slice of attachments' uuids which will be deleted from the release
 // editAttachments accept a map of attachment uuid to new attachment name which will be updated with attachments.
-func UpdateRelease(doer *models.User, gitRepo *git.Repository, rel *models.Release,
-	addAttachmentUUIDs, delAttachmentUUIDs []string, editAttachments map[string]string) (err error) {
+func UpdateRelease(ctx context.Context, doer *user_model.User, gitRepo *git.Repository, rel *repo_model.Release,
+	addAttachmentUUIDs, delAttachmentUUIDs []string, editAttachments map[string]string,
+) error {
 	if rel.ID == 0 {
 		return errors.New("UpdateRelease only accepts an exist release")
 	}
-	isCreated, err := createTag(gitRepo, rel, "")
+	isTagCreated, err := createTag(gitRepo.Ctx, gitRepo, rel, "")
 	if err != nil {
 		return err
 	}
 	rel.LowerTagName = strings.ToLower(rel.TagName)
 
-	ctx, commiter, err := models.TxDBContext()
+	ctx, committer, err := db.TxContext(ctx)
 	if err != nil {
 		return err
 	}
-	defer commiter.Close()
+	defer committer.Close()
 
-	if err = models.UpdateRelease(ctx, rel); err != nil {
+	oldRelease, err := repo_model.GetReleaseByID(ctx, rel.ID)
+	if err != nil {
+		return err
+	}
+	isConvertedFromTag := oldRelease.IsTag && !rel.IsTag
+
+	if err = repo_model.UpdateRelease(ctx, rel); err != nil {
 		return err
 	}
 
-	if err = models.AddReleaseAttachments(ctx, rel.ID, addAttachmentUUIDs); err != nil {
-		return fmt.Errorf("AddReleaseAttachments: %v", err)
+	if err = repo_model.AddReleaseAttachments(ctx, rel.ID, addAttachmentUUIDs); err != nil {
+		return fmt.Errorf("AddReleaseAttachments: %w", err)
 	}
 
-	var deletedUUIDsMap = make(map[string]bool)
+	deletedUUIDs := make(container.Set[string])
 	if len(delAttachmentUUIDs) > 0 {
 		// Check attachments
-		attachments, err := models.GetAttachmentsByUUIDs(ctx, delAttachmentUUIDs)
+		attachments, err := repo_model.GetAttachmentsByUUIDs(ctx, delAttachmentUUIDs)
 		if err != nil {
-			return fmt.Errorf("GetAttachmentsByUUIDs [uuids: %v]: %v", delAttachmentUUIDs, err)
+			return fmt.Errorf("GetAttachmentsByUUIDs [uuids: %v]: %w", delAttachmentUUIDs, err)
 		}
 		for _, attach := range attachments {
 			if attach.ReleaseID != rel.ID {
-				return errors.New("delete attachement of release permission denied")
+				return util.SilentWrap{
+					Message: "delete attachment of release permission denied",
+					Err:     util.ErrPermissionDenied,
+				}
 			}
-			deletedUUIDsMap[attach.UUID] = true
+			deletedUUIDs.Add(attach.UUID)
 		}
 
-		if _, err := models.DeleteAttachments(ctx, attachments, false); err != nil {
-			return fmt.Errorf("DeleteAttachments [uuids: %v]: %v", delAttachmentUUIDs, err)
+		if _, err := repo_model.DeleteAttachments(ctx, attachments, true); err != nil {
+			return fmt.Errorf("DeleteAttachments [uuids: %v]: %w", delAttachmentUUIDs, err)
 		}
 	}
 
 	if len(editAttachments) > 0 {
-		var updateAttachmentsList = make([]string, 0, len(editAttachments))
+		updateAttachmentsList := make([]string, 0, len(editAttachments))
 		for k := range editAttachments {
 			updateAttachmentsList = append(updateAttachmentsList, k)
 		}
 		// Check attachments
-		attachments, err := models.GetAttachmentsByUUIDs(ctx, updateAttachmentsList)
+		attachments, err := repo_model.GetAttachmentsByUUIDs(ctx, updateAttachmentsList)
 		if err != nil {
-			return fmt.Errorf("GetAttachmentsByUUIDs [uuids: %v]: %v", updateAttachmentsList, err)
+			return fmt.Errorf("GetAttachmentsByUUIDs [uuids: %v]: %w", updateAttachmentsList, err)
 		}
 		for _, attach := range attachments {
 			if attach.ReleaseID != rel.ID {
-				return errors.New("update attachement of release permission denied")
+				return util.SilentWrap{
+					Message: "update attachment of release permission denied",
+					Err:     util.ErrPermissionDenied,
+				}
 			}
 		}
 
 		for uuid, newName := range editAttachments {
-			if !deletedUUIDsMap[uuid] {
-				if err = models.UpdateAttachmentByUUID(ctx, &models.Attachment{
+			if !deletedUUIDs.Contains(uuid) {
+				if err = repo_model.UpdateAttachmentByUUID(ctx, &repo_model.Attachment{
 					UUID: uuid,
 					Name: newName,
 				}, "name"); err != nil {
@@ -232,12 +283,12 @@ func UpdateRelease(doer *models.User, gitRepo *git.Repository, rel *models.Relea
 		}
 	}
 
-	if err = commiter.Commit(); err != nil {
-		return
+	if err := committer.Commit(); err != nil {
+		return err
 	}
 
 	for _, uuid := range delAttachmentUUIDs {
-		if err := storage.Attachments.Delete(models.AttachmentRelativePath(uuid)); err != nil {
+		if err := storage.Attachments.Delete(repo_model.AttachmentRelativePath(uuid)); err != nil {
 			// Even delete files failed, but the attachments has been removed from database, so we
 			// should not return error but only record the error on logs.
 			// users have to delete this attachments manually or we should have a
@@ -246,65 +297,69 @@ func UpdateRelease(doer *models.User, gitRepo *git.Repository, rel *models.Relea
 		}
 	}
 
-	if !isCreated {
-		notification.NotifyUpdateRelease(doer, rel)
-		return
-	}
-
 	if !rel.IsDraft {
-		notification.NotifyNewRelease(rel)
+		if !isTagCreated && !isConvertedFromTag {
+			notify_service.UpdateRelease(gitRepo.Ctx, doer, rel)
+			return nil
+		}
+		notify_service.NewRelease(gitRepo.Ctx, rel)
 	}
-
-	return err
+	return nil
 }
 
 // DeleteReleaseByID deletes a release and corresponding Git tag by given ID.
-func DeleteReleaseByID(id int64, doer *models.User, delTag bool) error {
-	rel, err := models.GetReleaseByID(id)
-	if err != nil {
-		return fmt.Errorf("GetReleaseByID: %v", err)
-	}
-
-	repo, err := models.GetRepositoryByID(rel.RepoID)
-	if err != nil {
-		return fmt.Errorf("GetRepositoryByID: %v", err)
-	}
-
+func DeleteReleaseByID(ctx context.Context, repo *repo_model.Repository, rel *repo_model.Release, doer *user_model.User, delTag bool) error {
 	if delTag {
-		if stdout, err := git.NewCommand("tag", "-d", rel.TagName).
-			SetDescription(fmt.Sprintf("DeleteReleaseByID (git tag -d): %d", rel.ID)).
-			RunInDir(repo.RepoPath()); err != nil && !strings.Contains(err.Error(), "not found") {
-			log.Error("DeleteReleaseByID (git tag -d): %d in %v Failed:\nStdout: %s\nError: %v", rel.ID, repo, stdout, err)
-			return fmt.Errorf("git tag -d: %v", err)
+		protectedTags, err := git_model.GetProtectedTags(ctx, rel.RepoID)
+		if err != nil {
+			return fmt.Errorf("GetProtectedTags: %w", err)
+		}
+		isAllowed, err := git_model.IsUserAllowedToControlTag(ctx, protectedTags, rel.TagName, rel.PublisherID)
+		if err != nil {
+			return err
+		}
+		if !isAllowed {
+			return models.ErrProtectedTagName{
+				TagName: rel.TagName,
+			}
 		}
 
-		notification.NotifyPushCommits(
-			doer, repo,
-			&repository.PushUpdateOptions{
-				RefFullName: git.TagPrefix + rel.TagName,
-				OldCommitID: rel.Sha1,
-				NewCommitID: git.EmptySHA,
-			}, repository.NewPushCommits())
-		notification.NotifyDeleteRef(doer, repo, "tag", git.TagPrefix+rel.TagName)
+		if stdout, _, err := git.NewCommand(ctx, "tag", "-d").AddDashesAndList(rel.TagName).
+			SetDescription(fmt.Sprintf("DeleteReleaseByID (git tag -d): %d", rel.ID)).
+			RunStdString(&git.RunOpts{Dir: repo.RepoPath()}); err != nil && !strings.Contains(err.Error(), "not found") {
+			log.Error("DeleteReleaseByID (git tag -d): %d in %v Failed:\nStdout: %s\nError: %v", rel.ID, repo, stdout, err)
+			return fmt.Errorf("git tag -d: %w", err)
+		}
 
-		if err := models.DeleteReleaseByID(id); err != nil {
-			return fmt.Errorf("DeleteReleaseByID: %v", err)
+		refName := git.RefNameFromTag(rel.TagName)
+		objectFormat := git.ObjectFormatFromName(repo.ObjectFormatName)
+		notify_service.PushCommits(
+			ctx, doer, repo,
+			&repository.PushUpdateOptions{
+				RefFullName: refName,
+				OldCommitID: rel.Sha1,
+				NewCommitID: objectFormat.EmptyObjectID().String(),
+			}, repository.NewPushCommits())
+		notify_service.DeleteRef(ctx, doer, repo, refName)
+
+		if _, err := db.DeleteByID[repo_model.Release](ctx, rel.ID); err != nil {
+			return fmt.Errorf("DeleteReleaseByID: %w", err)
 		}
 	} else {
 		rel.IsTag = true
 
-		if err = models.UpdateRelease(models.DefaultDBContext(), rel); err != nil {
-			return fmt.Errorf("Update: %v", err)
+		if err := repo_model.UpdateRelease(ctx, rel); err != nil {
+			return fmt.Errorf("Update: %w", err)
 		}
 	}
 
 	rel.Repo = repo
-	if err = rel.LoadAttributes(); err != nil {
-		return fmt.Errorf("LoadAttributes: %v", err)
+	if err := rel.LoadAttributes(ctx); err != nil {
+		return fmt.Errorf("LoadAttributes: %w", err)
 	}
 
-	if err := models.DeleteAttachmentsByRelease(rel.ID); err != nil {
-		return fmt.Errorf("DeleteAttachments: %v", err)
+	if err := repo_model.DeleteAttachmentsByRelease(ctx, rel.ID); err != nil {
+		return fmt.Errorf("DeleteAttachments: %w", err)
 	}
 
 	for i := range rel.Attachments {
@@ -314,7 +369,13 @@ func DeleteReleaseByID(id int64, doer *models.User, delTag bool) error {
 		}
 	}
 
-	notification.NotifyDeleteRelease(doer, rel)
-
+	if !rel.IsDraft {
+		notify_service.DeleteRelease(ctx, doer, rel)
+	}
 	return nil
+}
+
+// Init start release service
+func Init() error {
+	return initTagSyncQueue(graceful.GetManager().ShutdownContext())
 }

@@ -1,19 +1,19 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package private
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"net/http"
 	"net/url"
 	"strconv"
 	"time"
 
+	"code.gitea.io/gitea/modules/git"
+	"code.gitea.io/gitea/modules/optional"
+	"code.gitea.io/gitea/modules/repository"
 	"code.gitea.io/gitea/modules/setting"
-	jsoniter "github.com/json-iterator/go"
 )
 
 // Git environment variables
@@ -34,28 +34,31 @@ const (
 )
 
 // Bool checks for a key in the map and parses as a boolean
-func (g GitPushOptions) Bool(key string, def bool) bool {
+func (g GitPushOptions) Bool(key string) optional.Option[bool] {
 	if val, ok := g[key]; ok {
 		if b, err := strconv.ParseBool(val); err == nil {
-			return b
+			return optional.Some(b)
 		}
 	}
-	return def
+	return optional.None[bool]()
 }
 
 // HookOptions represents the options for the Hook calls
 type HookOptions struct {
 	OldCommitIDs                    []string
 	NewCommitIDs                    []string
-	RefFullNames                    []string
+	RefFullNames                    []git.RefName
 	UserID                          int64
 	UserName                        string
 	GitObjectDirectory              string
 	GitAlternativeObjectDirectories string
 	GitQuarantinePath               string
 	GitPushOptions                  GitPushOptions
-	ProtectedBranchID               int64
-	IsDeployKey                     bool
+	PullRequestID                   int64
+	PushTrigger                     repository.PushTrigger
+	DeployKeyID                     int64 // if the pusher is a DeployKey, then UserID is the repo's org user.
+	IsWiki                          bool
+	ActionPerm                      int
 }
 
 // SSHLogOption ssh log options
@@ -79,101 +82,69 @@ type HookPostReceiveBranchResult struct {
 	URL     string
 }
 
+// HookProcReceiveResult represents an individual result from ProcReceive
+type HookProcReceiveResult struct {
+	Results []HookProcReceiveRefResult
+	Err     string
+}
+
+// HookProcReceiveRefResult represents an individual result from ProcReceive
+type HookProcReceiveRefResult struct {
+	OldOID            string
+	NewOID            string
+	Ref               string
+	OriginalRef       git.RefName
+	IsForcePush       bool
+	IsNotMatched      bool
+	Err               string
+	IsCreatePR        bool
+	URL               string
+	ShouldShowMessage bool
+	HeadBranch        string
+}
+
 // HookPreReceive check whether the provided commits are allowed
-func HookPreReceive(ownerName, repoName string, opts HookOptions) (int, string) {
-	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/hook/pre-receive/%s/%s",
-		url.PathEscape(ownerName),
-		url.PathEscape(repoName),
-	)
-	req := newInternalRequest(reqURL, "POST")
-	req = req.Header("Content-Type", "application/json")
-	json := jsoniter.ConfigCompatibleWithStandardLibrary
-	jsonBytes, _ := json.Marshal(opts)
-	req.Body(jsonBytes)
-	req.SetTimeout(60*time.Second, time.Duration(60+len(opts.OldCommitIDs))*time.Second)
-	resp, err := req.Response()
-	if err != nil {
-		return http.StatusInternalServerError, fmt.Sprintf("Unable to contact gitea: %v", err.Error())
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return resp.StatusCode, decodeJSONError(resp).Err
-	}
-
-	return http.StatusOK, ""
+func HookPreReceive(ctx context.Context, ownerName, repoName string, opts HookOptions) ResponseExtra {
+	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/hook/pre-receive/%s/%s", url.PathEscape(ownerName), url.PathEscape(repoName))
+	req := newInternalRequest(ctx, reqURL, "POST", opts)
+	req.SetReadWriteTimeout(time.Duration(60+len(opts.OldCommitIDs)) * time.Second)
+	_, extra := requestJSONResp(req, &ResponseText{})
+	return extra
 }
 
 // HookPostReceive updates services and users
-func HookPostReceive(ownerName, repoName string, opts HookOptions) (*HookPostReceiveResult, string) {
-	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/hook/post-receive/%s/%s",
-		url.PathEscape(ownerName),
-		url.PathEscape(repoName),
-	)
+func HookPostReceive(ctx context.Context, ownerName, repoName string, opts HookOptions) (*HookPostReceiveResult, ResponseExtra) {
+	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/hook/post-receive/%s/%s", url.PathEscape(ownerName), url.PathEscape(repoName))
+	req := newInternalRequest(ctx, reqURL, "POST", opts)
+	req.SetReadWriteTimeout(time.Duration(60+len(opts.OldCommitIDs)) * time.Second)
+	return requestJSONResp(req, &HookPostReceiveResult{})
+}
 
-	req := newInternalRequest(reqURL, "POST")
-	req = req.Header("Content-Type", "application/json")
-	req.SetTimeout(60*time.Second, time.Duration(60+len(opts.OldCommitIDs))*time.Second)
-	json := jsoniter.ConfigCompatibleWithStandardLibrary
-	jsonBytes, _ := json.Marshal(opts)
-	req.Body(jsonBytes)
-	resp, err := req.Response()
-	if err != nil {
-		return nil, fmt.Sprintf("Unable to contact gitea: %v", err.Error())
-	}
-	defer resp.Body.Close()
+// HookProcReceive proc-receive hook
+func HookProcReceive(ctx context.Context, ownerName, repoName string, opts HookOptions) (*HookProcReceiveResult, ResponseExtra) {
+	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/hook/proc-receive/%s/%s", url.PathEscape(ownerName), url.PathEscape(repoName))
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, decodeJSONError(resp).Err
-	}
-	res := &HookPostReceiveResult{}
-	_ = json.NewDecoder(resp.Body).Decode(res)
-
-	return res, ""
+	req := newInternalRequest(ctx, reqURL, "POST", opts)
+	req.SetReadWriteTimeout(time.Duration(60+len(opts.OldCommitIDs)) * time.Second)
+	return requestJSONResp(req, &HookProcReceiveResult{})
 }
 
 // SetDefaultBranch will set the default branch to the provided branch for the provided repository
-func SetDefaultBranch(ownerName, repoName, branch string) error {
+func SetDefaultBranch(ctx context.Context, ownerName, repoName, branch string) ResponseExtra {
 	reqURL := setting.LocalURL + fmt.Sprintf("api/internal/hook/set-default-branch/%s/%s/%s",
 		url.PathEscape(ownerName),
 		url.PathEscape(repoName),
 		url.PathEscape(branch),
 	)
-	req := newInternalRequest(reqURL, "POST")
-	req = req.Header("Content-Type", "application/json")
-
-	req.SetTimeout(60*time.Second, 60*time.Second)
-	resp, err := req.Response()
-	if err != nil {
-		return fmt.Errorf("Unable to contact gitea: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Error returned from gitea: %v", decodeJSONError(resp).Err)
-	}
-	return nil
+	req := newInternalRequest(ctx, reqURL, "POST")
+	_, extra := requestJSONResp(req, &ResponseText{})
+	return extra
 }
 
 // SSHLog sends ssh error log response
-func SSHLog(isErr bool, msg string) error {
+func SSHLog(ctx context.Context, isErr bool, msg string) error {
 	reqURL := setting.LocalURL + "api/internal/ssh/log"
-	req := newInternalRequest(reqURL, "POST")
-	req = req.Header("Content-Type", "application/json")
-
-	jsonBytes, _ := json.Marshal(&SSHLogOption{
-		IsError: isErr,
-		Message: msg,
-	})
-	req.Body(jsonBytes)
-
-	req.SetTimeout(60*time.Second, 60*time.Second)
-	resp, err := req.Response()
-	if err != nil {
-		return fmt.Errorf("unable to contact gitea: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Error returned from gitea: %v", decodeJSONError(resp).Err)
-	}
-	return nil
+	req := newInternalRequest(ctx, reqURL, "POST", &SSHLogOption{IsError: isErr, Message: msg})
+	_, extra := requestJSONResp(req, &ResponseText{})
+	return extra.Error
 }

@@ -1,7 +1,6 @@
 // Copyright 2015 The Gogs Authors. All rights reserved.
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package admin
 
@@ -11,35 +10,43 @@ import (
 	"net/http"
 
 	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/convert"
+	asymkey_model "code.gitea.io/gitea/models/asymkey"
+	"code.gitea.io/gitea/models/auth"
+	"code.gitea.io/gitea/models/db"
+	user_model "code.gitea.io/gitea/models/user"
+	"code.gitea.io/gitea/modules/auth/password"
 	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/password"
+	"code.gitea.io/gitea/modules/optional"
+	"code.gitea.io/gitea/modules/setting"
 	api "code.gitea.io/gitea/modules/structs"
+	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/modules/web"
 	"code.gitea.io/gitea/routers/api/v1/user"
 	"code.gitea.io/gitea/routers/api/v1/utils"
+	asymkey_service "code.gitea.io/gitea/services/asymkey"
+	"code.gitea.io/gitea/services/context"
+	"code.gitea.io/gitea/services/convert"
 	"code.gitea.io/gitea/services/mailer"
+	user_service "code.gitea.io/gitea/services/user"
 )
 
-func parseLoginSource(ctx *context.APIContext, u *models.User, sourceID int64, loginName string) {
+func parseAuthSource(ctx *context.APIContext, u *user_model.User, sourceID int64) {
 	if sourceID == 0 {
 		return
 	}
 
-	source, err := models.GetLoginSourceByID(sourceID)
+	source, err := auth.GetSourceByID(ctx, sourceID)
 	if err != nil {
-		if models.IsErrLoginSourceNotExist(err) {
+		if auth.IsErrSourceNotExist(err) {
 			ctx.Error(http.StatusUnprocessableEntity, "", err)
 		} else {
-			ctx.Error(http.StatusInternalServerError, "GetLoginSourceByID", err)
+			ctx.Error(http.StatusInternalServerError, "auth.GetSourceByID", err)
 		}
 		return
 	}
 
 	u.LoginType = source.Type
 	u.LoginSource = source.ID
-	u.LoginName = loginName
 }
 
 // CreateUser create a user
@@ -65,58 +72,93 @@ func CreateUser(ctx *context.APIContext) {
 	//     "$ref": "#/responses/forbidden"
 	//   "422":
 	//     "$ref": "#/responses/validationError"
+
 	form := web.GetForm(ctx).(*api.CreateUserOption)
-	u := &models.User{
+
+	u := &user_model.User{
 		Name:               form.Username,
 		FullName:           form.FullName,
 		Email:              form.Email,
 		Passwd:             form.Password,
 		MustChangePassword: true,
-		IsActive:           true,
-		LoginType:          models.LoginPlain,
+		LoginType:          auth.Plain,
+		LoginName:          form.LoginName,
 	}
 	if form.MustChangePassword != nil {
 		u.MustChangePassword = *form.MustChangePassword
 	}
 
-	parseLoginSource(ctx, u, form.SourceID, form.LoginName)
+	parseAuthSource(ctx, u, form.SourceID)
 	if ctx.Written() {
 		return
 	}
-	if !password.IsComplexEnough(form.Password) {
-		err := errors.New("PasswordComplexity")
-		ctx.Error(http.StatusBadRequest, "PasswordComplexity", err)
-		return
-	}
-	pwned, err := password.IsPwned(ctx, form.Password)
-	if pwned {
-		if err != nil {
-			log.Error(err.Error())
+
+	if u.LoginType == auth.Plain {
+		if len(form.Password) < setting.MinPasswordLength {
+			err := errors.New("PasswordIsRequired")
+			ctx.Error(http.StatusBadRequest, "PasswordIsRequired", err)
+			return
 		}
-		ctx.Data["Err_Password"] = true
-		ctx.Error(http.StatusBadRequest, "PasswordPwned", errors.New("PasswordPwned"))
-		return
+
+		if !password.IsComplexEnough(form.Password) {
+			err := errors.New("PasswordComplexity")
+			ctx.Error(http.StatusBadRequest, "PasswordComplexity", err)
+			return
+		}
+
+		if err := password.IsPwned(ctx, form.Password); err != nil {
+			if password.IsErrIsPwnedRequest(err) {
+				log.Error(err.Error())
+			}
+			ctx.Error(http.StatusBadRequest, "PasswordPwned", errors.New("PasswordPwned"))
+			return
+		}
 	}
-	if err := models.CreateUser(u); err != nil {
-		if models.IsErrUserAlreadyExist(err) ||
-			models.IsErrEmailAlreadyUsed(err) ||
-			models.IsErrNameReserved(err) ||
-			models.IsErrNameCharsNotAllowed(err) ||
-			models.IsErrEmailInvalid(err) ||
-			models.IsErrNamePatternNotAllowed(err) {
+
+	overwriteDefault := &user_model.CreateUserOverwriteOptions{
+		IsActive:     optional.Some(true),
+		IsRestricted: optional.FromPtr(form.Restricted),
+	}
+
+	if form.Visibility != "" {
+		visibility := api.VisibilityModes[form.Visibility]
+		overwriteDefault.Visibility = &visibility
+	}
+
+	// Update the user creation timestamp. This can only be done after the user
+	// record has been inserted into the database; the insert intself will always
+	// set the creation timestamp to "now".
+	if form.Created != nil {
+		u.CreatedUnix = timeutil.TimeStamp(form.Created.Unix())
+		u.UpdatedUnix = u.CreatedUnix
+	}
+
+	if err := user_model.AdminCreateUser(ctx, u, overwriteDefault); err != nil {
+		if user_model.IsErrUserAlreadyExist(err) ||
+			user_model.IsErrEmailAlreadyUsed(err) ||
+			db.IsErrNameReserved(err) ||
+			db.IsErrNameCharsNotAllowed(err) ||
+			user_model.IsErrEmailCharIsNotSupported(err) ||
+			user_model.IsErrEmailInvalid(err) ||
+			db.IsErrNamePatternNotAllowed(err) {
 			ctx.Error(http.StatusUnprocessableEntity, "", err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "CreateUser", err)
 		}
 		return
 	}
-	log.Trace("Account created by admin (%s): %s", ctx.User.Name, u.Name)
+
+	if !user_model.IsEmailDomainAllowed(u.Email) {
+		ctx.Resp.Header().Add("X-Gitea-Warning", fmt.Sprintf("the domain of user email %s conflicts with EMAIL_DOMAIN_ALLOWLIST or EMAIL_DOMAIN_BLOCKLIST", u.Email))
+	}
+
+	log.Trace("Account created by admin (%s): %s", ctx.Doer.Name, u.Name)
 
 	// Send email notification.
 	if form.SendNotify {
 		mailer.SendRegisterNotifyMail(u)
 	}
-	ctx.JSON(http.StatusCreated, convert.ToUser(u, ctx.User))
+	ctx.JSON(http.StatusCreated, convert.ToUser(ctx, u, ctx.Doer))
 }
 
 // EditUser api for modifying a user's information
@@ -141,107 +183,81 @@ func EditUser(ctx *context.APIContext) {
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/User"
+	//   "400":
+	//     "$ref": "#/responses/error"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
 	//   "422":
 	//     "$ref": "#/responses/validationError"
+
 	form := web.GetForm(ctx).(*api.EditUserOption)
-	u := user.GetUserByParams(ctx)
-	if ctx.Written() {
-		return
-	}
 
-	parseLoginSource(ctx, u, form.SourceID, form.LoginName)
-	if ctx.Written() {
-		return
+	authOpts := &user_service.UpdateAuthOptions{
+		LoginSource:        optional.FromNonDefault(form.SourceID),
+		LoginName:          optional.Some(form.LoginName),
+		Password:           optional.FromNonDefault(form.Password),
+		MustChangePassword: optional.FromPtr(form.MustChangePassword),
+		ProhibitLogin:      optional.FromPtr(form.ProhibitLogin),
 	}
-
-	if len(form.Password) != 0 {
-		if !password.IsComplexEnough(form.Password) {
-			err := errors.New("PasswordComplexity")
+	if err := user_service.UpdateAuth(ctx, ctx.ContextUser, authOpts); err != nil {
+		switch {
+		case errors.Is(err, password.ErrMinLength):
+			ctx.Error(http.StatusBadRequest, "PasswordTooShort", fmt.Errorf("password must be at least %d characters", setting.MinPasswordLength))
+		case errors.Is(err, password.ErrComplexity):
 			ctx.Error(http.StatusBadRequest, "PasswordComplexity", err)
-			return
+		case errors.Is(err, password.ErrIsPwned), password.IsErrIsPwnedRequest(err):
+			ctx.Error(http.StatusBadRequest, "PasswordIsPwned", err)
+		default:
+			ctx.Error(http.StatusInternalServerError, "UpdateAuth", err)
 		}
-		pwned, err := password.IsPwned(ctx, form.Password)
-		if pwned {
-			if err != nil {
-				log.Error(err.Error())
-			}
-			ctx.Data["Err_Password"] = true
-			ctx.Error(http.StatusBadRequest, "PasswordPwned", errors.New("PasswordPwned"))
-			return
-		}
-		if u.Salt, err = models.GetUserSalt(); err != nil {
-			ctx.Error(http.StatusInternalServerError, "UpdateUser", err)
-			return
-		}
-		if err = u.SetPassword(form.Password); err != nil {
-			ctx.InternalServerError(err)
-			return
-		}
+		return
 	}
 
-	if form.MustChangePassword != nil {
-		u.MustChangePassword = *form.MustChangePassword
-	}
-
-	u.LoginName = form.LoginName
-
-	if form.FullName != nil {
-		u.FullName = *form.FullName
-	}
 	if form.Email != nil {
-		u.Email = *form.Email
-		if len(u.Email) == 0 {
-			ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("email is not allowed to be empty string"))
+		if err := user_service.AdminAddOrSetPrimaryEmailAddress(ctx, ctx.ContextUser, *form.Email); err != nil {
+			switch {
+			case user_model.IsErrEmailCharIsNotSupported(err), user_model.IsErrEmailInvalid(err):
+				ctx.Error(http.StatusBadRequest, "EmailInvalid", err)
+			case user_model.IsErrEmailAlreadyUsed(err):
+				ctx.Error(http.StatusBadRequest, "EmailUsed", err)
+			default:
+				ctx.Error(http.StatusInternalServerError, "AddOrSetPrimaryEmailAddress", err)
+			}
 			return
 		}
-	}
-	if form.Website != nil {
-		u.Website = *form.Website
-	}
-	if form.Location != nil {
-		u.Location = *form.Location
-	}
-	if form.Description != nil {
-		u.Description = *form.Description
-	}
-	if form.Active != nil {
-		u.IsActive = *form.Active
-	}
-	if form.Admin != nil {
-		u.IsAdmin = *form.Admin
-	}
-	if form.AllowGitHook != nil {
-		u.AllowGitHook = *form.AllowGitHook
-	}
-	if form.AllowImportLocal != nil {
-		u.AllowImportLocal = *form.AllowImportLocal
-	}
-	if form.MaxRepoCreation != nil {
-		u.MaxRepoCreation = *form.MaxRepoCreation
-	}
-	if form.AllowCreateOrganization != nil {
-		u.AllowCreateOrganization = *form.AllowCreateOrganization
-	}
-	if form.ProhibitLogin != nil {
-		u.ProhibitLogin = *form.ProhibitLogin
-	}
-	if form.Restricted != nil {
-		u.IsRestricted = *form.Restricted
+
+		if !user_model.IsEmailDomainAllowed(*form.Email) {
+			ctx.Resp.Header().Add("X-Gitea-Warning", fmt.Sprintf("the domain of user email %s conflicts with EMAIL_DOMAIN_ALLOWLIST or EMAIL_DOMAIN_BLOCKLIST", *form.Email))
+		}
 	}
 
-	if err := models.UpdateUser(u); err != nil {
-		if models.IsErrEmailAlreadyUsed(err) || models.IsErrEmailInvalid(err) {
-			ctx.Error(http.StatusUnprocessableEntity, "", err)
+	opts := &user_service.UpdateOptions{
+		FullName:                optional.FromPtr(form.FullName),
+		Website:                 optional.FromPtr(form.Website),
+		Location:                optional.FromPtr(form.Location),
+		Description:             optional.FromPtr(form.Description),
+		IsActive:                optional.FromPtr(form.Active),
+		IsAdmin:                 optional.FromPtr(form.Admin),
+		Visibility:              optional.FromNonDefault(api.VisibilityModes[form.Visibility]),
+		AllowGitHook:            optional.FromPtr(form.AllowGitHook),
+		AllowImportLocal:        optional.FromPtr(form.AllowImportLocal),
+		MaxRepoCreation:         optional.FromPtr(form.MaxRepoCreation),
+		AllowCreateOrganization: optional.FromPtr(form.AllowCreateOrganization),
+		IsRestricted:            optional.FromPtr(form.Restricted),
+	}
+
+	if err := user_service.UpdateUser(ctx, ctx.ContextUser, opts); err != nil {
+		if models.IsErrDeleteLastAdminUser(err) {
+			ctx.Error(http.StatusBadRequest, "LastAdmin", err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "UpdateUser", err)
 		}
 		return
 	}
-	log.Trace("Account profile updated by admin (%s): %s", ctx.User.Name, u.Name)
 
-	ctx.JSON(http.StatusOK, convert.ToUser(u, ctx.User))
+	log.Trace("Account profile updated by admin (%s): %s", ctx.Doer.Name, ctx.ContextUser.Name)
+
+	ctx.JSON(http.StatusOK, convert.ToUser(ctx, ctx.ContextUser, ctx.Doer))
 }
 
 // DeleteUser api for deleting a user
@@ -257,34 +273,43 @@ func DeleteUser(ctx *context.APIContext) {
 	//   description: username of user to delete
 	//   type: string
 	//   required: true
+	// - name: purge
+	//   in: query
+	//   description: purge the user from the system completely
+	//   type: boolean
 	// responses:
 	//   "204":
 	//     "$ref": "#/responses/empty"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
 	//   "422":
 	//     "$ref": "#/responses/validationError"
 
-	u := user.GetUserByParams(ctx)
-	if ctx.Written() {
+	if ctx.ContextUser.IsOrganization() {
+		ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("%s is an organization not a user", ctx.ContextUser.Name))
 		return
 	}
 
-	if u.IsOrganization() {
-		ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("%s is an organization not a user", u.Name))
+	// admin should not delete themself
+	if ctx.ContextUser.ID == ctx.Doer.ID {
+		ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("you cannot delete yourself"))
 		return
 	}
 
-	if err := models.DeleteUser(u); err != nil {
+	if err := user_service.DeleteUser(ctx, ctx.ContextUser, ctx.FormBool("purge")); err != nil {
 		if models.IsErrUserOwnRepos(err) ||
-			models.IsErrUserHasOrgs(err) {
+			models.IsErrUserHasOrgs(err) ||
+			models.IsErrUserOwnPackages(err) ||
+			models.IsErrDeleteLastAdminUser(err) {
 			ctx.Error(http.StatusUnprocessableEntity, "", err)
 		} else {
 			ctx.Error(http.StatusInternalServerError, "DeleteUser", err)
 		}
 		return
 	}
-	log.Trace("Account deleted by admin(%s): %s", ctx.User.Name, u.Name)
+	log.Trace("Account deleted by admin(%s): %s", ctx.Doer.Name, ctx.ContextUser.Name)
 
 	ctx.Status(http.StatusNoContent)
 }
@@ -315,12 +340,10 @@ func CreatePublicKey(ctx *context.APIContext) {
 	//     "$ref": "#/responses/forbidden"
 	//   "422":
 	//     "$ref": "#/responses/validationError"
+
 	form := web.GetForm(ctx).(*api.CreateKeyOption)
-	u := user.GetUserByParams(ctx)
-	if ctx.Written() {
-		return
-	}
-	user.CreateUserPublicKey(ctx, *form, u.ID)
+
+	user.CreateUserPublicKey(ctx, *form, ctx.ContextUser.ID)
 }
 
 // DeleteUserPublicKey api for deleting a user's public key
@@ -350,34 +373,38 @@ func DeleteUserPublicKey(ctx *context.APIContext) {
 	//   "404":
 	//     "$ref": "#/responses/notFound"
 
-	u := user.GetUserByParams(ctx)
-	if ctx.Written() {
-		return
-	}
-
-	if err := models.DeletePublicKey(u, ctx.ParamsInt64(":id")); err != nil {
-		if models.IsErrKeyNotExist(err) {
+	if err := asymkey_service.DeletePublicKey(ctx, ctx.ContextUser, ctx.PathParamInt64(":id")); err != nil {
+		if asymkey_model.IsErrKeyNotExist(err) {
 			ctx.NotFound()
-		} else if models.IsErrKeyAccessDenied(err) {
+		} else if asymkey_model.IsErrKeyAccessDenied(err) {
 			ctx.Error(http.StatusForbidden, "", "You do not have access to this key")
 		} else {
 			ctx.Error(http.StatusInternalServerError, "DeleteUserPublicKey", err)
 		}
 		return
 	}
-	log.Trace("Key deleted by admin(%s): %s", ctx.User.Name, u.Name)
+	log.Trace("Key deleted by admin(%s): %s", ctx.Doer.Name, ctx.ContextUser.Name)
 
 	ctx.Status(http.StatusNoContent)
 }
 
-//GetAllUsers API for getting information of all the users
-func GetAllUsers(ctx *context.APIContext) {
-	// swagger:operation GET /admin/users admin adminGetAllUsers
+// SearchUsers API for getting information of the users according the filter conditions
+func SearchUsers(ctx *context.APIContext) {
+	// swagger:operation GET /admin/users admin adminSearchUsers
 	// ---
-	// summary: List all users
+	// summary: Search users according filter conditions
 	// produces:
 	// - application/json
 	// parameters:
+	// - name: source_id
+	//   in: query
+	//   description: ID of the user's login source to search for
+	//   type: integer
+	//   format: int64
+	// - name: login_name
+	//   in: query
+	//   description: user's login name to search for
+	//   type: string
 	// - name: page
 	//   in: query
 	//   description: page number of results to return (1-based)
@@ -394,23 +421,80 @@ func GetAllUsers(ctx *context.APIContext) {
 
 	listOptions := utils.GetListOptions(ctx)
 
-	users, maxResults, err := models.SearchUsers(&models.SearchUserOptions{
-		Type:        models.UserTypeIndividual,
-		OrderBy:     models.SearchOrderByAlphabetically,
+	users, maxResults, err := user_model.SearchUsers(ctx, &user_model.SearchUserOptions{
+		Actor:       ctx.Doer,
+		Type:        user_model.UserTypeIndividual,
+		LoginName:   ctx.FormTrim("login_name"),
+		SourceID:    ctx.FormInt64("source_id"),
+		OrderBy:     db.SearchOrderByAlphabetically,
 		ListOptions: listOptions,
 	})
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetAllUsers", err)
+		ctx.Error(http.StatusInternalServerError, "SearchUsers", err)
 		return
 	}
 
 	results := make([]*api.User, len(users))
 	for i := range users {
-		results[i] = convert.ToUser(users[i], ctx.User)
+		results[i] = convert.ToUser(ctx, users[i], ctx.Doer)
 	}
 
 	ctx.SetLinkHeader(int(maxResults), listOptions.PageSize)
-	ctx.Header().Set("X-Total-Count", fmt.Sprintf("%d", maxResults))
-	ctx.Header().Set("Access-Control-Expose-Headers", "X-Total-Count, Link")
+	ctx.SetTotalCountHeader(maxResults)
 	ctx.JSON(http.StatusOK, &results)
+}
+
+// RenameUser api for renaming a user
+func RenameUser(ctx *context.APIContext) {
+	// swagger:operation POST /admin/users/{username}/rename admin adminRenameUser
+	// ---
+	// summary: Rename a user
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: username
+	//   in: path
+	//   description: existing username of user
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   required: true
+	//   schema:
+	//     "$ref": "#/definitions/RenameUserOption"
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   "403":
+	//     "$ref": "#/responses/forbidden"
+	//   "422":
+	//     "$ref": "#/responses/validationError"
+
+	if ctx.ContextUser.IsOrganization() {
+		ctx.Error(http.StatusUnprocessableEntity, "", fmt.Errorf("%s is an organization not a user", ctx.ContextUser.Name))
+		return
+	}
+
+	oldName := ctx.ContextUser.Name
+	newName := web.GetForm(ctx).(*api.RenameUserOption).NewName
+
+	// Check if user name has been changed
+	if err := user_service.RenameUser(ctx, ctx.ContextUser, newName); err != nil {
+		switch {
+		case user_model.IsErrUserAlreadyExist(err):
+			ctx.Error(http.StatusUnprocessableEntity, "", ctx.Tr("form.username_been_taken"))
+		case db.IsErrNameReserved(err):
+			ctx.Error(http.StatusUnprocessableEntity, "", ctx.Tr("user.form.name_reserved", newName))
+		case db.IsErrNamePatternNotAllowed(err):
+			ctx.Error(http.StatusUnprocessableEntity, "", ctx.Tr("user.form.name_pattern_not_allowed", newName))
+		case db.IsErrNameCharsNotAllowed(err):
+			ctx.Error(http.StatusUnprocessableEntity, "", ctx.Tr("user.form.name_chars_not_allowed", newName))
+		default:
+			ctx.ServerError("ChangeUserName", err)
+		}
+		return
+	}
+
+	log.Trace("User name changed: %s -> %s", oldName, newName)
+	ctx.Status(http.StatusNoContent)
 }

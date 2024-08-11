@@ -1,15 +1,14 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package settings
 
 import (
 	"net/http"
 
-	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/setting"
 	api "code.gitea.io/gitea/modules/structs"
+	"code.gitea.io/gitea/services/context"
 )
 
 // GetGeneralUISettings returns instance's global settings for ui
@@ -25,6 +24,7 @@ func GetGeneralUISettings(ctx *context.APIContext) {
 	ctx.JSON(http.StatusOK, api.GeneralUISettings{
 		DefaultTheme:     setting.UI.DefaultTheme,
 		AllowedReactions: setting.UI.Reactions,
+		CustomEmojis:     setting.UI.CustomEmojis,
 	})
 }
 
@@ -57,7 +57,7 @@ func GetGeneralRepoSettings(ctx *context.APIContext) {
 	//   "200":
 	//     "$ref": "#/responses/GeneralRepoSettings"
 	ctx.JSON(http.StatusOK, api.GeneralRepoSettings{
-		MirrorsDisabled:      setting.Repository.DisableMirrors,
+		MirrorsDisabled:      !setting.Mirror.Enabled,
 		HTTPGitDisabled:      setting.Repository.DisableHTTPGit,
 		MigrationsDisabled:   setting.Repository.DisableMigrations,
 		StarsDisabled:        setting.Repository.DisableStars,

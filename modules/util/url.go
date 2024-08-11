@@ -1,6 +1,5 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package util
 
@@ -39,4 +38,13 @@ func URLJoin(base string, elems ...string) string {
 		return joinedURL[1:] // Removing leading '/' if needed
 	}
 	return joinedURL
+}
+
+func SanitizeURL(s string) (string, error) {
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", err
+	}
+	u.User = nil
+	return u.String(), nil
 }

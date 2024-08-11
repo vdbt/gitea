@@ -1,18 +1,16 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
-// +build !gogit
+//go:build !gogit
 
 package git
 
 import (
 	"io"
-	"io/ioutil"
 )
 
-func (repo *Repository) getTree(id SHA1) (*Tree, error) {
-	wr, rd, cancel := repo.CatFileBatch()
+func (repo *Repository) getTree(id ObjectID) (*Tree, error) {
+	wr, rd, cancel := repo.CatFileBatch(repo.Ctx)
 	defer cancel()
 
 	_, _ = wr.Write([]byte(id.String() + "\n"))
@@ -26,15 +24,15 @@ func (repo *Repository) getTree(id SHA1) (*Tree, error) {
 	switch typ {
 	case "tag":
 		resolvedID := id
-		data, err := ioutil.ReadAll(io.LimitReader(rd, size))
+		data, err := io.ReadAll(io.LimitReader(rd, size))
 		if err != nil {
 			return nil, err
 		}
-		tag, err := parseTagData(data)
+		tag, err := parseTagData(id.Type(), data)
 		if err != nil {
 			return nil, err
 		}
-		commit, err := tag.Commit()
+		commit, err := tag.Commit(repo)
 		if err != nil {
 			return nil, err
 		}
@@ -53,13 +51,20 @@ func (repo *Repository) getTree(id SHA1) (*Tree, error) {
 	case "tree":
 		tree := NewTree(repo, id)
 		tree.ResolvedID = id
-		tree.entries, err = catBatchParseTreeEntries(tree, rd, size)
+		objectFormat, err := repo.GetObjectFormat()
+		if err != nil {
+			return nil, err
+		}
+		tree.entries, err = catBatchParseTreeEntries(objectFormat, tree, rd, size)
 		if err != nil {
 			return nil, err
 		}
 		tree.entriesParsed = true
 		return tree, nil
 	default:
+		if err := DiscardFull(rd, size+1); err != nil {
+			return nil, err
+		}
 		return nil, ErrNotExist{
 			ID: id.String(),
 		}
@@ -68,7 +73,11 @@ func (repo *Repository) getTree(id SHA1) (*Tree, error) {
 
 // GetTree find the tree object in the repository.
 func (repo *Repository) GetTree(idStr string) (*Tree, error) {
-	if len(idStr) != 40 {
+	objectFormat, err := repo.GetObjectFormat()
+	if err != nil {
+		return nil, err
+	}
+	if len(idStr) != objectFormat.FullLength() {
 		res, err := repo.GetRefCommitID(idStr)
 		if err != nil {
 			return nil, err

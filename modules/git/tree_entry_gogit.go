@@ -1,9 +1,8 @@
 // Copyright 2015 The Gogs Authors. All rights reserved.
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
-// +build gogit
+//go:build gogit
 
 package git
 
@@ -15,7 +14,7 @@ import (
 
 // TreeEntry the leaf in the git tree
 type TreeEntry struct {
-	ID SHA1
+	ID ObjectID
 
 	gogitTreeEntry *object.TreeEntry
 	ptree          *Tree
@@ -89,7 +88,7 @@ func (te *TreeEntry) Blob() *Blob {
 	}
 
 	return &Blob{
-		ID:              te.gogitTreeEntry.Hash,
+		ID:              ParseGogitHash(te.gogitTreeEntry.Hash),
 		gogitEncodedObj: encodedObj,
 		name:            te.Name(),
 	}

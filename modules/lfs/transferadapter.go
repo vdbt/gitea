@@ -1,58 +1,89 @@
 // Copyright 2021 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package lfs
 
 import (
+	"bytes"
 	"context"
-	"errors"
-	"fmt"
 	"io"
 	"net/http"
+
+	"code.gitea.io/gitea/modules/json"
+	"code.gitea.io/gitea/modules/log"
 )
 
-// TransferAdapter represents an adapter for downloading/uploading LFS objects
+// TransferAdapter represents an adapter for downloading/uploading LFS objects.
 type TransferAdapter interface {
 	Name() string
-	Download(ctx context.Context, r *ObjectResponse) (io.ReadCloser, error)
-	//Upload(ctx context.Context, reader io.Reader) error
+	Download(ctx context.Context, l *Link) (io.ReadCloser, error)
+	Upload(ctx context.Context, l *Link, p Pointer, r io.Reader) error
+	Verify(ctx context.Context, l *Link, p Pointer) error
 }
 
-// BasicTransferAdapter implements the "basic" adapter
+// BasicTransferAdapter implements the "basic" adapter.
 type BasicTransferAdapter struct {
 	client *http.Client
 }
 
-// Name returns the name of the adapter
+// Name returns the name of the adapter.
 func (a *BasicTransferAdapter) Name() string {
 	return "basic"
 }
 
-// Download reads the download location and downloads the data
-func (a *BasicTransferAdapter) Download(ctx context.Context, r *ObjectResponse) (io.ReadCloser, error) {
-	download, ok := r.Actions["download"]
-	if !ok {
-		return nil, errors.New("lfs.BasicTransferAdapter.Download: Action 'download' not found")
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", download.Href, nil)
+// Download reads the download location and downloads the data.
+func (a *BasicTransferAdapter) Download(ctx context.Context, l *Link) (io.ReadCloser, error) {
+	req, err := createRequest(ctx, http.MethodGet, l.Href, l.Header, nil)
 	if err != nil {
-		return nil, fmt.Errorf("lfs.BasicTransferAdapter.Download http.NewRequestWithContext: %w", err)
+		return nil, err
 	}
-	for key, value := range download.Header {
-		req.Header.Set(key, value)
-	}
-
-	res, err := a.client.Do(req)
+	log.Debug("Download Request: %+v", req)
+	resp, err := performRequest(ctx, a.client, req)
 	if err != nil {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		return nil, fmt.Errorf("lfs.BasicTransferAdapter.Download http.Do: %w", err)
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// Upload sends the content to the LFS server.
+func (a *BasicTransferAdapter) Upload(ctx context.Context, l *Link, p Pointer, r io.Reader) error {
+	req, err := createRequest(ctx, http.MethodPut, l.Href, l.Header, r)
+	if err != nil {
+		return err
+	}
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/octet-stream")
+	}
+	if req.Header.Get("Transfer-Encoding") == "chunked" {
+		req.TransferEncoding = []string{"chunked"}
+	}
+	req.ContentLength = p.Size
+
+	res, err := performRequest(ctx, a.client, req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	return nil
+}
+
+// Verify calls the verify handler on the LFS server
+func (a *BasicTransferAdapter) Verify(ctx context.Context, l *Link, p Pointer) error {
+	b, err := json.Marshal(p)
+	if err != nil {
+		log.Error("Error encoding json: %v", err)
+		return err
 	}
 
-	return res.Body, nil
+	req, err := createRequest(ctx, http.MethodPost, l.Href, l.Header, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", MediaType)
+	res, err := performRequest(ctx, a.client, req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	return nil
 }

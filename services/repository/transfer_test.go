@@ -1,6 +1,5 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package repository
 
@@ -9,9 +8,16 @@ import (
 	"testing"
 
 	"code.gitea.io/gitea/models"
-	"code.gitea.io/gitea/modules/notification"
-	"code.gitea.io/gitea/modules/notification/action"
+	activities_model "code.gitea.io/gitea/models/activities"
+	"code.gitea.io/gitea/models/db"
+	"code.gitea.io/gitea/models/organization"
+	access_model "code.gitea.io/gitea/models/perm/access"
+	repo_model "code.gitea.io/gitea/models/repo"
+	"code.gitea.io/gitea/models/unittest"
+	user_model "code.gitea.io/gitea/models/user"
 	"code.gitea.io/gitea/modules/util"
+	"code.gitea.io/gitea/services/feed"
+	notify_service "code.gitea.io/gitea/services/notify"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -20,35 +26,98 @@ var notifySync sync.Once
 
 func registerNotifier() {
 	notifySync.Do(func() {
-		notification.RegisterNotifier(action.NewNotifier())
+		notify_service.RegisterNotifier(feed.NewNotifier())
 	})
 }
 
 func TestTransferOwnership(t *testing.T) {
 	registerNotifier()
 
-	assert.NoError(t, models.PrepareTestDatabase())
+	assert.NoError(t, unittest.PrepareTestDatabase())
 
-	doer := models.AssertExistsAndLoadBean(t, &models.User{ID: 2}).(*models.User)
-	repo := models.AssertExistsAndLoadBean(t, &models.Repository{ID: 3}).(*models.Repository)
-	repo.Owner = models.AssertExistsAndLoadBean(t, &models.User{ID: repo.OwnerID}).(*models.User)
-	assert.NoError(t, TransferOwnership(doer, doer, repo, nil))
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 3})
+	repo.Owner = unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+	assert.NoError(t, TransferOwnership(db.DefaultContext, doer, doer, repo, nil))
 
-	transferredRepo := models.AssertExistsAndLoadBean(t, &models.Repository{ID: 3}).(*models.Repository)
+	transferredRepo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 3})
 	assert.EqualValues(t, 2, transferredRepo.OwnerID)
 
-	exist, err := util.IsExist(models.RepoPath("user3", "repo3"))
+	exist, err := util.IsExist(repo_model.RepoPath("org3", "repo3"))
 	assert.NoError(t, err)
 	assert.False(t, exist)
-	exist, err = util.IsExist(models.RepoPath("user2", "repo3"))
+	exist, err = util.IsExist(repo_model.RepoPath("user2", "repo3"))
 	assert.NoError(t, err)
 	assert.True(t, exist)
-	models.AssertExistsAndLoadBean(t, &models.Action{
-		OpType:    models.ActionTransferRepo,
+	unittest.AssertExistsAndLoadBean(t, &activities_model.Action{
+		OpType:    activities_model.ActionTransferRepo,
 		ActUserID: 2,
 		RepoID:    3,
-		Content:   "user3/repo3",
+		Content:   "org3/repo3",
 	})
 
-	models.CheckConsistencyFor(t, &models.Repository{}, &models.User{}, &models.Team{})
+	unittest.CheckConsistencyFor(t, &repo_model.Repository{}, &user_model.User{}, &organization.Team{})
+}
+
+func TestStartRepositoryTransferSetPermission(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 3})
+	recipient := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 5})
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 3})
+	repo.Owner = unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+
+	hasAccess, err := access_model.HasAnyUnitAccess(db.DefaultContext, recipient.ID, repo)
+	assert.NoError(t, err)
+	assert.False(t, hasAccess)
+
+	assert.NoError(t, StartRepositoryTransfer(db.DefaultContext, doer, recipient, repo, nil))
+
+	hasAccess, err = access_model.HasAnyUnitAccess(db.DefaultContext, recipient.ID, repo)
+	assert.NoError(t, err)
+	assert.True(t, hasAccess)
+
+	unittest.CheckConsistencyFor(t, &repo_model.Repository{}, &user_model.User{}, &organization.Team{})
+}
+
+func TestRepositoryTransfer(t *testing.T) {
+	assert.NoError(t, unittest.PrepareTestDatabase())
+
+	doer := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 3})
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 3})
+
+	transfer, err := models.GetPendingRepositoryTransfer(db.DefaultContext, repo)
+	assert.NoError(t, err)
+	assert.NotNil(t, transfer)
+
+	// Cancel transfer
+	assert.NoError(t, CancelRepositoryTransfer(db.DefaultContext, repo))
+
+	transfer, err = models.GetPendingRepositoryTransfer(db.DefaultContext, repo)
+	assert.Error(t, err)
+	assert.Nil(t, transfer)
+	assert.True(t, models.IsErrNoPendingTransfer(err))
+
+	user2 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+
+	assert.NoError(t, models.CreatePendingRepositoryTransfer(db.DefaultContext, doer, user2, repo.ID, nil))
+
+	transfer, err = models.GetPendingRepositoryTransfer(db.DefaultContext, repo)
+	assert.Nil(t, err)
+	assert.NoError(t, transfer.LoadAttributes(db.DefaultContext))
+	assert.Equal(t, "user2", transfer.Recipient.Name)
+
+	org6 := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
+
+	// Only transfer can be started at any given time
+	err = models.CreatePendingRepositoryTransfer(db.DefaultContext, doer, org6, repo.ID, nil)
+	assert.Error(t, err)
+	assert.True(t, models.IsErrRepoTransferInProgress(err))
+
+	// Unknown user
+	err = models.CreatePendingRepositoryTransfer(db.DefaultContext, doer, &user_model.User{ID: 1000, LowerName: "user1000"}, repo.ID, nil)
+	assert.Error(t, err)
+
+	// Cancel transfer
+	assert.NoError(t, CancelRepositoryTransfer(db.DefaultContext, repo))
 }

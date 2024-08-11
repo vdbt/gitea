@@ -1,20 +1,21 @@
 // Copyright 2017 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package external
 
 import (
+	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 
+	"code.gitea.io/gitea/modules/graceful"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/markup"
+	"code.gitea.io/gitea/modules/process"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/util"
 )
@@ -30,8 +31,13 @@ func RegisterRenderers() {
 
 // Renderer implements markup.Renderer for external tools
 type Renderer struct {
-	setting.MarkupRenderer
+	*setting.MarkupRenderer
 }
+
+var (
+	_ markup.PostProcessRenderer = (*Renderer)(nil)
+	_ markup.ExternalRenderer    = (*Renderer)(nil)
+)
 
 // Name returns the external tool name
 func (p *Renderer) Name() string {
@@ -48,6 +54,21 @@ func (p *Renderer) Extensions() []string {
 	return p.FileExtensions
 }
 
+// SanitizerRules implements markup.Renderer
+func (p *Renderer) SanitizerRules() []setting.MarkupSanitizerRule {
+	return p.MarkupSanitizerRules
+}
+
+// SanitizerDisabled disabled sanitize if return true
+func (p *Renderer) SanitizerDisabled() bool {
+	return p.RenderContentMode == setting.RenderContentModeNoSanitizer || p.RenderContentMode == setting.RenderContentModeIframe
+}
+
+// DisplayInIFrame represents whether render the content with an iframe
+func (p *Renderer) DisplayInIFrame() bool {
+	return p.RenderContentMode == setting.RenderContentModeIframe
+}
+
 func envMark(envName string) string {
 	if runtime.GOOS == "windows" {
 		return "%" + envName + "%"
@@ -58,18 +79,19 @@ func envMark(envName string) string {
 // Render renders the data of the document to HTML via the external tool.
 func (p *Renderer) Render(ctx *markup.RenderContext, input io.Reader, output io.Writer) error {
 	var (
-		urlRawPrefix = strings.Replace(ctx.URLPrefix, "/src/", "/raw/", 1)
-		command      = strings.NewReplacer(envMark("GITEA_PREFIX_SRC"), ctx.URLPrefix,
-			envMark("GITEA_PREFIX_RAW"), urlRawPrefix).Replace(p.Command)
+		command = strings.NewReplacer(
+			envMark("GITEA_PREFIX_SRC"), ctx.Links.SrcLink(),
+			envMark("GITEA_PREFIX_RAW"), ctx.Links.RawLink(),
+		).Replace(p.Command)
 		commands = strings.Fields(command)
 		args     = commands[1:]
 	)
 
 	if p.IsInputFile {
 		// write to temp file
-		f, err := ioutil.TempFile("", "gitea_input")
+		f, err := os.CreateTemp("", "gitea_input")
 		if err != nil {
-			return fmt.Errorf("%s create temp file when rendering %s failed: %v", p.Name(), p.Command, err)
+			return fmt.Errorf("%s create temp file when rendering %s failed: %w", p.Name(), p.Command, err)
 		}
 		tmpPath := f.Name()
 		defer func() {
@@ -81,28 +103,44 @@ func (p *Renderer) Render(ctx *markup.RenderContext, input io.Reader, output io.
 		_, err = io.Copy(f, input)
 		if err != nil {
 			f.Close()
-			return fmt.Errorf("%s write data to temp file when rendering %s failed: %v", p.Name(), p.Command, err)
+			return fmt.Errorf("%s write data to temp file when rendering %s failed: %w", p.Name(), p.Command, err)
 		}
 
 		err = f.Close()
 		if err != nil {
-			return fmt.Errorf("%s close temp file when rendering %s failed: %v", p.Name(), p.Command, err)
+			return fmt.Errorf("%s close temp file when rendering %s failed: %w", p.Name(), p.Command, err)
 		}
 		args = append(args, f.Name())
 	}
 
-	cmd := exec.Command(commands[0], args...)
+	if ctx == nil || ctx.Ctx == nil {
+		if ctx == nil {
+			log.Warn("RenderContext not provided defaulting to empty ctx")
+			ctx = &markup.RenderContext{}
+		}
+		log.Warn("RenderContext did not provide context, defaulting to Shutdown context")
+		ctx.Ctx = graceful.GetManager().ShutdownContext()
+	}
+
+	processCtx, _, finished := process.GetManager().AddContext(ctx.Ctx, fmt.Sprintf("Render [%s] for %s", commands[0], ctx.Links.SrcLink()))
+	defer finished()
+
+	cmd := exec.CommandContext(processCtx, commands[0], args...)
 	cmd.Env = append(
 		os.Environ(),
-		"GITEA_PREFIX_SRC="+ctx.URLPrefix,
-		"GITEA_PREFIX_RAW="+urlRawPrefix,
+		"GITEA_PREFIX_SRC="+ctx.Links.SrcLink(),
+		"GITEA_PREFIX_RAW="+ctx.Links.RawLink(),
 	)
 	if !p.IsInputFile {
 		cmd.Stdin = input
 	}
+	var stderr bytes.Buffer
 	cmd.Stdout = output
+	cmd.Stderr = &stderr
+	process.SetSysProcAttribute(cmd)
+
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s render run command %s %v failed: %v", p.Name(), commands[0], args, err)
+		return fmt.Errorf("%s render run command %s %v failed: %w\nStderr: %s", p.Name(), commands[0], args, err, stderr.String())
 	}
 	return nil
 }

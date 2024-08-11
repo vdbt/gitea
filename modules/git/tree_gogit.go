@@ -1,9 +1,8 @@
 // Copyright 2015 The Gogs Authors. All rights reserved.
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
-// +build gogit
+//go:build gogit
 
 package git
 
@@ -16,8 +15,8 @@ import (
 
 // Tree represents a flat directory listing.
 type Tree struct {
-	ID         SHA1
-	ResolvedID SHA1
+	ID         ObjectID
+	ResolvedID ObjectID
 	repo       *Repository
 
 	gogitTree *object.Tree
@@ -27,7 +26,7 @@ type Tree struct {
 }
 
 func (t *Tree) loadTreeObject() error {
-	gogitTree, err := t.repo.gogitRepo.TreeObject(t.ID)
+	gogitTree, err := t.repo.gogitRepo.TreeObject(plumbing.Hash(t.ID.RawValue()))
 	if err != nil {
 		return err
 	}
@@ -48,7 +47,7 @@ func (t *Tree) ListEntries() (Entries, error) {
 	entries := make([]*TreeEntry, len(t.gogitTree.Entries))
 	for i, entry := range t.gogitTree.Entries {
 		entries[i] = &TreeEntry{
-			ID:             entry.Hash,
+			ID:             ParseGogitHash(entry.Hash),
 			gogitTreeEntry: &t.gogitTree.Entries[i],
 			ptree:          t,
 		}
@@ -57,8 +56,8 @@ func (t *Tree) ListEntries() (Entries, error) {
 	return entries, nil
 }
 
-// ListEntriesRecursive returns all entries of current tree recursively including all subtrees
-func (t *Tree) ListEntriesRecursive() (Entries, error) {
+// ListEntriesRecursiveWithSize returns all entries of current tree recursively including all subtrees
+func (t *Tree) ListEntriesRecursiveWithSize() (Entries, error) {
 	if t.gogitTree == nil {
 		err := t.loadTreeObject()
 		if err != nil {
@@ -82,7 +81,7 @@ func (t *Tree) ListEntriesRecursive() (Entries, error) {
 		}
 
 		convertedEntry := &TreeEntry{
-			ID:             entry.Hash,
+			ID:             ParseGogitHash(entry.Hash),
 			gogitTreeEntry: &entry,
 			ptree:          t,
 			fullName:       fullName,
@@ -91,4 +90,9 @@ func (t *Tree) ListEntriesRecursive() (Entries, error) {
 	}
 
 	return entries, nil
+}
+
+// ListEntriesRecursiveFast is the alias of ListEntriesRecursiveWithSize for the gogit version
+func (t *Tree) ListEntriesRecursiveFast() (Entries, error) {
+	return t.ListEntriesRecursiveWithSize()
 }

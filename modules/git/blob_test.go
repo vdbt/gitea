@@ -1,12 +1,11 @@
 // Copyright 2015 The Gogs Authors. All rights reserved.
 // Copyright 2019 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package git
 
 import (
-	"io/ioutil"
+	"io"
 	"path/filepath"
 	"testing"
 
@@ -17,7 +16,7 @@ import (
 func TestBlob_Data(t *testing.T) {
 	output := "file2\n"
 	bareRepo1Path := filepath.Join(testReposDir, "repo1_bare")
-	repo, err := OpenRepository(bareRepo1Path)
+	repo, err := openRepositoryWithDefaultContext(bareRepo1Path)
 	if !assert.NoError(t, err) {
 		t.Fatal()
 	}
@@ -30,7 +29,7 @@ func TestBlob_Data(t *testing.T) {
 	assert.NoError(t, err)
 	require.NotNil(t, r)
 
-	data, err := ioutil.ReadAll(r)
+	data, err := io.ReadAll(r)
 	assert.NoError(t, r.Close())
 
 	assert.NoError(t, err)
@@ -39,7 +38,7 @@ func TestBlob_Data(t *testing.T) {
 
 func Benchmark_Blob_Data(b *testing.B) {
 	bareRepo1Path := filepath.Join(testReposDir, "repo1_bare")
-	repo, err := OpenRepository(bareRepo1Path)
+	repo, err := openRepositoryWithDefaultContext(bareRepo1Path)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -55,7 +54,7 @@ func Benchmark_Blob_Data(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		ioutil.ReadAll(r)
+		io.ReadAll(r)
 		_ = r.Close()
 	}
 }

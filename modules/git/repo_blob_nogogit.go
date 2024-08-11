@@ -1,12 +1,11 @@
 // Copyright 2020 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
-// +build !gogit
+//go:build !gogit
 
 package git
 
-func (repo *Repository) getBlob(id SHA1) (*Blob, error) {
+func (repo *Repository) getBlob(id ObjectID) (*Blob, error) {
 	if id.IsZero() {
 		return nil, ErrNotExist{id.String(), ""}
 	}

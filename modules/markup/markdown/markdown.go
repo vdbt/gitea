@@ -1,26 +1,26 @@
 // Copyright 2014 The Gogs Authors. All rights reserved.
 // Copyright 2018 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package markdown
 
 import (
 	"fmt"
+	"html/template"
 	"io"
-	"io/ioutil"
 	"strings"
 	"sync"
 
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/markup"
 	"code.gitea.io/gitea/modules/markup/common"
+	"code.gitea.io/gitea/modules/markup/markdown/math"
 	"code.gitea.io/gitea/modules/setting"
 	giteautil "code.gitea.io/gitea/modules/util"
 
-	chromahtml "github.com/alecthomas/chroma/formatters/html"
+	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
 	"github.com/yuin/goldmark"
-	highlighting "github.com/yuin/goldmark-highlighting"
+	highlighting "github.com/yuin/goldmark-highlighting/v2"
 	meta "github.com/yuin/goldmark-meta"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/parser"
@@ -29,20 +29,18 @@ import (
 	"github.com/yuin/goldmark/util"
 )
 
-var converter goldmark.Markdown
-var once = sync.Once{}
+var (
+	specMarkdown     goldmark.Markdown
+	specMarkdownOnce sync.Once
+)
 
-var urlPrefixKey = parser.NewContextKey()
-var isWikiKey = parser.NewContextKey()
-var renderMetasKey = parser.NewContextKey()
-
-type closesWithError interface {
-	io.WriteCloser
-	CloseWithError(err error) error
-}
+var (
+	renderContextKey = parser.NewContextKey()
+	renderConfigKey  = parser.NewContextKey()
+)
 
 type limitWriter struct {
-	w     closesWithError
+	w     io.Writer
 	sum   int64
 	limit int64
 }
@@ -56,38 +54,27 @@ func (l *limitWriter) Write(data []byte) (int, error) {
 		if err != nil {
 			return n, err
 		}
-		_ = l.w.Close()
-		return n, fmt.Errorf("Rendered content too large - truncating render")
+		return n, fmt.Errorf("rendered content too large - truncating render")
 	}
 	n, err := l.w.Write(data)
 	l.sum += int64(n)
 	return n, err
 }
 
-// Close closes the writer
-func (l *limitWriter) Close() error {
-	return l.w.Close()
-}
-
-// CloseWithError closes the writer
-func (l *limitWriter) CloseWithError(err error) error {
-	return l.w.CloseWithError(err)
-}
-
 // newParserContext creates a parser.Context with the render context set
 func newParserContext(ctx *markup.RenderContext) parser.Context {
 	pc := parser.NewContext(parser.WithIDs(newPrefixedIDs()))
-	pc.Set(urlPrefixKey, ctx.URLPrefix)
-	pc.Set(isWikiKey, ctx.IsWiki)
-	pc.Set(renderMetasKey, ctx.Metas)
+	pc.Set(renderContextKey, ctx)
 	return pc
 }
 
-// actualRender renders Markdown to HTML without handling special links.
-func actualRender(ctx *markup.RenderContext, input io.Reader, output io.Writer) error {
-	once.Do(func() {
-		converter = goldmark.New(
-			goldmark.WithExtensions(extension.Table,
+// SpecializedMarkdown sets up the Gitea specific markdown extensions
+func SpecializedMarkdown() goldmark.Markdown {
+	specMarkdownOnce.Do(func() {
+		specMarkdown = goldmark.New(
+			goldmark.WithExtensions(
+				extension.NewTable(
+					extension.WithTableCellAlignMethod(extension.TableCellAlignAttribute)),
 				extension.Strikethrough,
 				extension.TaskList,
 				extension.DefinitionList,
@@ -106,25 +93,19 @@ func actualRender(ctx *markup.RenderContext, input io.Reader, output io.Writer) 
 
 							languageStr := string(language)
 
-							preClasses := []string{}
-							if languageStr == "mermaid" {
+							preClasses := []string{"code-block"}
+							if languageStr == "mermaid" || languageStr == "math" {
 								preClasses = append(preClasses, "is-loading")
 							}
 
-							if len(preClasses) > 0 {
-								_, err := w.WriteString(`<pre class="` + strings.Join(preClasses, " ") + `">`)
-								if err != nil {
-									return
-								}
-							} else {
-								_, err := w.WriteString(`<pre>`)
-								if err != nil {
-									return
-								}
+							_, err := w.WriteString(`<pre class="` + strings.Join(preClasses, " ") + `">`)
+							if err != nil {
+								return
 							}
 
 							// include language-x class as part of commonmark spec
-							_, err := w.WriteString(`<code class="chroma language-` + string(language) + `">`)
+							// the "display" class is used by "js/markup/math.js" to render the code element as a block
+							_, err = w.WriteString(`<code class="chroma language-` + string(language) + ` display">`)
 							if err != nil {
 								return
 							}
@@ -136,13 +117,16 @@ func actualRender(ctx *markup.RenderContext, input io.Reader, output io.Writer) 
 						}
 					}),
 				),
+				math.NewExtension(
+					math.Enabled(setting.Markdown.EnableMath),
+				),
 				meta.Meta,
 			),
 			goldmark.WithParserOptions(
 				parser.WithAttribute(),
 				parser.WithAutoHeadingID(),
 				parser.WithASTTransformers(
-					util.Prioritized(&ASTTransformer{}, 10000),
+					util.Prioritized(NewASTTransformer(), 10000),
 				),
 			),
 			goldmark.WithRendererOptions(
@@ -151,59 +135,72 @@ func actualRender(ctx *markup.RenderContext, input io.Reader, output io.Writer) 
 		)
 
 		// Override the original Tasklist renderer!
-		converter.Renderer().AddOptions(
+		specMarkdown.Renderer().AddOptions(
 			renderer.WithNodeRenderers(
 				util.Prioritized(NewHTMLRenderer(), 10),
 			),
 		)
-
 	})
+	return specMarkdown
+}
 
-	rd, wr := io.Pipe()
-	defer func() {
-		_ = rd.Close()
-		_ = wr.Close()
-	}()
-
+// actualRender renders Markdown to HTML without handling special links.
+func actualRender(ctx *markup.RenderContext, input io.Reader, output io.Writer) error {
+	converter := SpecializedMarkdown()
 	lw := &limitWriter{
-		w:     wr,
+		w:     output,
 		limit: setting.UI.MaxDisplayFileSize * 3,
 	}
 
-	// FIXME: should we include a timeout that closes the pipe to abort the renderer and sanitizer if it takes too long?
-	go func() {
-		defer func() {
-			err := recover()
-			if err == nil {
-				return
-			}
-
-			log.Warn("Unable to render markdown due to panic in goldmark: %v", err)
-			if log.IsDebug() {
-				log.Debug("Panic in markdown: %v\n%s", err, string(log.Stack(2)))
-			}
-			_ = lw.CloseWithError(fmt.Errorf("%v", err))
-		}()
-
-		// FIXME: Don't read all to memory, but goldmark doesn't support
-		pc := newParserContext(ctx)
-		buf, err := ioutil.ReadAll(input)
-		if err != nil {
-			log.Error("Unable to ReadAll: %v", err)
+	// FIXME: should we include a timeout to abort the renderer if it takes too long?
+	defer func() {
+		err := recover()
+		if err == nil {
 			return
 		}
-		if err := converter.Convert(giteautil.NormalizeEOL(buf), lw, parser.WithContext(pc)); err != nil {
-			log.Error("Unable to render: %v", err)
-			_ = lw.CloseWithError(err)
-			return
+
+		log.Warn("Unable to render markdown due to panic in goldmark: %v", err)
+		if log.IsDebug() {
+			log.Debug("Panic in markdown: %v\n%s", err, log.Stack(2))
 		}
-		_ = lw.Close()
 	}()
-	buf := markup.SanitizeReader(rd)
-	_, err := io.Copy(output, buf)
-	return err
+
+	// FIXME: Don't read all to memory, but goldmark doesn't support
+	pc := newParserContext(ctx)
+	buf, err := io.ReadAll(input)
+	if err != nil {
+		log.Error("Unable to ReadAll: %v", err)
+		return err
+	}
+	buf = giteautil.NormalizeEOL(buf)
+
+	// Preserve original length.
+	bufWithMetadataLength := len(buf)
+
+	rc := &RenderConfig{
+		Meta: renderMetaModeFromString(string(ctx.RenderMetaAs)),
+		Icon: "table",
+		Lang: "",
+	}
+	buf, _ = ExtractMetadataBytes(buf, rc)
+
+	metaLength := bufWithMetadataLength - len(buf)
+	if metaLength < 0 {
+		metaLength = 0
+	}
+	rc.metaLength = metaLength
+
+	pc.Set(renderConfigKey, rc)
+
+	if err := converter.Convert(buf, lw, parser.WithContext(pc)); err != nil {
+		log.Error("Unable to render: %v", err)
+		return err
+	}
+
+	return nil
 }
 
+// Note: The output of this method must get sanitized.
 func render(ctx *markup.RenderContext, input io.Reader, output io.Writer) error {
 	defer func() {
 		err := recover()
@@ -211,23 +208,20 @@ func render(ctx *markup.RenderContext, input io.Reader, output io.Writer) error 
 			return
 		}
 
-		log.Warn("Unable to render markdown due to panic in goldmark - will return sanitized raw bytes")
+		log.Warn("Unable to render markdown due to panic in goldmark - will return raw bytes")
 		if log.IsDebug() {
-			log.Debug("Panic in markdown: %v\n%s", err, string(log.Stack(2)))
+			log.Debug("Panic in markdown: %v\n%s", err, log.Stack(2))
 		}
-		ret := markup.SanitizeReader(input)
-		_, err = io.Copy(output, ret)
+		_, err = io.Copy(output, input)
 		if err != nil {
-			log.Error("SanitizeReader failed: %v", err)
+			log.Error("io.Copy failed: %v", err)
 		}
 	}()
 	return actualRender(ctx, input, output)
 }
 
-var (
-	// MarkupName describes markup's name
-	MarkupName = "markdown"
-)
+// MarkupName describes markup's name
+var MarkupName = "markdown"
 
 func init() {
 	markup.RegisterRenderer(Renderer{})
@@ -236,17 +230,24 @@ func init() {
 // Renderer implements markup.Renderer
 type Renderer struct{}
 
+var _ markup.PostProcessRenderer = (*Renderer)(nil)
+
 // Name implements markup.Renderer
 func (Renderer) Name() string {
 	return MarkupName
 }
 
-// NeedPostProcess implements markup.Renderer
+// NeedPostProcess implements markup.PostProcessRenderer
 func (Renderer) NeedPostProcess() bool { return true }
 
 // Extensions implements markup.Renderer
 func (Renderer) Extensions() []string {
 	return setting.Markdown.FileExtensions
+}
+
+// SanitizerRules implements markup.Renderer
+func (Renderer) SanitizerRules() []setting.MarkupSanitizerRule {
+	return []setting.MarkupSanitizerRule{}
 }
 
 // Render implements markup.Renderer
@@ -256,24 +257,38 @@ func (Renderer) Render(ctx *markup.RenderContext, input io.Reader, output io.Wri
 
 // Render renders Markdown to HTML with all specific handling stuff.
 func Render(ctx *markup.RenderContext, input io.Reader, output io.Writer) error {
-	if ctx.Filename == "" {
-		ctx.Filename = "a.md"
+	if ctx.Type == "" {
+		ctx.Type = MarkupName
 	}
 	return markup.Render(ctx, input, output)
 }
 
 // RenderString renders Markdown string to HTML with all specific handling stuff and return string
-func RenderString(ctx *markup.RenderContext, content string) (string, error) {
+func RenderString(ctx *markup.RenderContext, content string) (template.HTML, error) {
 	var buf strings.Builder
 	if err := Render(ctx, strings.NewReader(content), &buf); err != nil {
 		return "", err
 	}
-	return buf.String(), nil
+	return template.HTML(buf.String()), nil
 }
 
 // RenderRaw renders Markdown to HTML without handling special links.
 func RenderRaw(ctx *markup.RenderContext, input io.Reader, output io.Writer) error {
-	return render(ctx, input, output)
+	rd, wr := io.Pipe()
+	defer func() {
+		_ = rd.Close()
+		_ = wr.Close()
+	}()
+
+	go func() {
+		if err := render(ctx, input, wr); err != nil {
+			_ = wr.CloseWithError(err)
+			return
+		}
+		_ = wr.Close()
+	}()
+
+	return markup.SanitizeReader(rd, "", output)
 }
 
 // RenderRawString renders Markdown to HTML without handling special links and return string
@@ -283,10 +298,4 @@ func RenderRawString(ctx *markup.RenderContext, content string) (string, error) 
 		return "", err
 	}
 	return buf.String(), nil
-}
-
-// IsMarkdownFile reports whether name looks like a Markdown file
-// based on its extension.
-func IsMarkdownFile(name string) bool {
-	return markup.IsMarkupFile(name, MarkupName)
 }

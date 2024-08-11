@@ -1,10 +1,11 @@
 // Copyright 2017 The Gitea Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package git
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,15 +16,34 @@ import (
 func TestCommitsCount(t *testing.T) {
 	bareRepo1Path := filepath.Join(testReposDir, "repo1_bare")
 
-	commitsCount, err := CommitsCount(bareRepo1Path, "8006ff9adbf0cb94da7dad9e537e53817f9fa5c0")
+	commitsCount, err := CommitsCount(DefaultContext,
+		CommitsCountOptions{
+			RepoPath: bareRepo1Path,
+			Revision: []string{"8006ff9adbf0cb94da7dad9e537e53817f9fa5c0"},
+		})
+
 	assert.NoError(t, err)
 	assert.Equal(t, int64(3), commitsCount)
+}
+
+func TestCommitsCountWithoutBase(t *testing.T) {
+	bareRepo1Path := filepath.Join(testReposDir, "repo1_bare")
+
+	commitsCount, err := CommitsCount(DefaultContext,
+		CommitsCountOptions{
+			RepoPath: bareRepo1Path,
+			Not:      "master",
+			Revision: []string{"branch1"},
+		})
+
+	assert.NoError(t, err)
+	assert.Equal(t, int64(2), commitsCount)
 }
 
 func TestGetFullCommitID(t *testing.T) {
 	bareRepo1Path := filepath.Join(testReposDir, "repo1_bare")
 
-	id, err := GetFullCommitID(bareRepo1Path, "8006ff9a")
+	id, err := GetFullCommitID(DefaultContext, bareRepo1Path, "8006ff9a")
 	assert.NoError(t, err)
 	assert.Equal(t, "8006ff9adbf0cb94da7dad9e537e53817f9fa5c0", id)
 }
@@ -31,7 +51,7 @@ func TestGetFullCommitID(t *testing.T) {
 func TestGetFullCommitIDError(t *testing.T) {
 	bareRepo1Path := filepath.Join(testReposDir, "repo1_bare")
 
-	id, err := GetFullCommitID(bareRepo1Path, "unknown")
+	id, err := GetFullCommitID(DefaultContext, bareRepo1Path, "unknown")
 	assert.Empty(t, id)
 	if assert.Error(t, err) {
 		assert.EqualError(t, err, "object does not exist [id: unknown, rel_path: ]")
@@ -63,10 +83,11 @@ gpgsig -----BEGIN PGP SIGNATURE-----
 
 empty commit`
 
-	sha := SHA1{0xfe, 0xaf, 0x4b, 0xa6, 0xbc, 0x63, 0x5f, 0xec, 0x44, 0x2f, 0x46, 0xdd, 0xd4, 0x51, 0x24, 0x16, 0xec, 0x43, 0xc2, 0xc2}
-	gitRepo, err := OpenRepository(filepath.Join(testReposDir, "repo1_bare"))
+	sha := &Sha1Hash{0xfe, 0xaf, 0x4b, 0xa6, 0xbc, 0x63, 0x5f, 0xec, 0x44, 0x2f, 0x46, 0xdd, 0xd4, 0x51, 0x24, 0x16, 0xec, 0x43, 0xc2, 0xc2}
+	gitRepo, err := openRepositoryWithDefaultContext(filepath.Join(testReposDir, "repo1_bare"))
 	assert.NoError(t, err)
 	assert.NotNil(t, gitRepo)
+	defer gitRepo.Close()
 
 	commitFromReader, err := CommitFromReader(gitRepo, sha, strings.NewReader(commitString))
 	assert.NoError(t, err)
@@ -106,11 +127,79 @@ empty commit`, commitFromReader.Signature.Payload)
 	assert.EqualValues(t, commitFromReader, commitFromReader2)
 }
 
+func TestCommitWithEncodingFromReader(t *testing.T) {
+	commitString := `feaf4ba6bc635fec442f46ddd4512416ec43c2c2 commit 1074
+tree ca3fad42080dd1a6d291b75acdfc46e5b9b307e5
+parent 47b24e7ab977ed31c5a39989d570847d6d0052af
+author KN4CK3R <admin@oldschoolhack.me> 1711702962 +0100
+committer KN4CK3R <admin@oldschoolhack.me> 1711702962 +0100
+encoding ISO-8859-1
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ iQGzBAABCgAdFiEE9HRrbqvYxPT8PXbefPSEkrowAa8FAmYGg7IACgkQfPSEkrow
+ Aa9olwv+P0HhtCM6CRvlUmPaqswRsDPNR4i66xyXGiSxdI9V5oJL7HLiQIM7KrFR
+ gizKa2COiGtugv8fE+TKqXKaJx6uJUJEjaBd8E9Af9PrAzjWj+A84lU6/PgPS8hq
+ zOfZraLOEWRH4tZcS+u2yFLu3ez2Wqh1xW5LNy7xqEedMXEFD1HwSJ0+pjacNkzr
+ frp6Asyt7xRI6YmgFJZJoRsS3Ktr6rtKeRL2IErSQQyorOqj6gKrglhrhfG/114j
+ FKB1v4or0WZ1DE8iP2SJZ3n+/K1IuWAINh7MVdb7PndfBPEa+IL+ucNk5uzEE8Jd
+ G8smGxXUeFEt2cP1dj2W8EgAxuA9sTnH9dqI5aRqy5ifDjuya7Emm8sdOUvtGdmn
+ SONRzusmu5n3DgV956REL7x62h7JuqmBz/12HZkr0z0zgXkcZ04q08pSJATX5N1F
+ yN+tWxTsWg+zhDk96d5Esdo9JMjcFvPv0eioo30GAERaz1hoD7zCMT4jgUFTQwgz
+ jw4YcO5u
+ =r3UU
+ -----END PGP SIGNATURE-----
+
+ISO-8859-1`
+
+	sha := &Sha1Hash{0xfe, 0xaf, 0x4b, 0xa6, 0xbc, 0x63, 0x5f, 0xec, 0x44, 0x2f, 0x46, 0xdd, 0xd4, 0x51, 0x24, 0x16, 0xec, 0x43, 0xc2, 0xc2}
+	gitRepo, err := openRepositoryWithDefaultContext(filepath.Join(testReposDir, "repo1_bare"))
+	assert.NoError(t, err)
+	assert.NotNil(t, gitRepo)
+	defer gitRepo.Close()
+
+	commitFromReader, err := CommitFromReader(gitRepo, sha, strings.NewReader(commitString))
+	assert.NoError(t, err)
+	if !assert.NotNil(t, commitFromReader) {
+		return
+	}
+	assert.EqualValues(t, sha, commitFromReader.ID)
+	assert.EqualValues(t, `-----BEGIN PGP SIGNATURE-----
+
+iQGzBAABCgAdFiEE9HRrbqvYxPT8PXbefPSEkrowAa8FAmYGg7IACgkQfPSEkrow
+Aa9olwv+P0HhtCM6CRvlUmPaqswRsDPNR4i66xyXGiSxdI9V5oJL7HLiQIM7KrFR
+gizKa2COiGtugv8fE+TKqXKaJx6uJUJEjaBd8E9Af9PrAzjWj+A84lU6/PgPS8hq
+zOfZraLOEWRH4tZcS+u2yFLu3ez2Wqh1xW5LNy7xqEedMXEFD1HwSJ0+pjacNkzr
+frp6Asyt7xRI6YmgFJZJoRsS3Ktr6rtKeRL2IErSQQyorOqj6gKrglhrhfG/114j
+FKB1v4or0WZ1DE8iP2SJZ3n+/K1IuWAINh7MVdb7PndfBPEa+IL+ucNk5uzEE8Jd
+G8smGxXUeFEt2cP1dj2W8EgAxuA9sTnH9dqI5aRqy5ifDjuya7Emm8sdOUvtGdmn
+SONRzusmu5n3DgV956REL7x62h7JuqmBz/12HZkr0z0zgXkcZ04q08pSJATX5N1F
+yN+tWxTsWg+zhDk96d5Esdo9JMjcFvPv0eioo30GAERaz1hoD7zCMT4jgUFTQwgz
+jw4YcO5u
+=r3UU
+-----END PGP SIGNATURE-----
+`, commitFromReader.Signature.Signature)
+	assert.EqualValues(t, `tree ca3fad42080dd1a6d291b75acdfc46e5b9b307e5
+parent 47b24e7ab977ed31c5a39989d570847d6d0052af
+author KN4CK3R <admin@oldschoolhack.me> 1711702962 +0100
+committer KN4CK3R <admin@oldschoolhack.me> 1711702962 +0100
+encoding ISO-8859-1
+
+ISO-8859-1`, commitFromReader.Signature.Payload)
+	assert.EqualValues(t, "KN4CK3R <admin@oldschoolhack.me>", commitFromReader.Author.String())
+
+	commitFromReader2, err := CommitFromReader(gitRepo, sha, strings.NewReader(commitString+"\n\n"))
+	assert.NoError(t, err)
+	commitFromReader.CommitMessage += "\n\n"
+	commitFromReader.Signature.Payload += "\n\n"
+	assert.EqualValues(t, commitFromReader, commitFromReader2)
+}
+
 func TestHasPreviousCommit(t *testing.T) {
 	bareRepo1Path := filepath.Join(testReposDir, "repo1_bare")
 
-	repo, err := OpenRepository(bareRepo1Path)
+	repo, err := openRepositoryWithDefaultContext(bareRepo1Path)
 	assert.NoError(t, err)
+	defer repo.Close()
 
 	commit, err := repo.GetCommit("8006ff9adbf0cb94da7dad9e537e53817f9fa5c0")
 	assert.NoError(t, err)
@@ -129,4 +218,147 @@ func TestHasPreviousCommit(t *testing.T) {
 	selfNot, err := commit.HasPreviousCommit(commit.ID)
 	assert.NoError(t, err)
 	assert.False(t, selfNot)
+}
+
+func TestParseCommitFileStatus(t *testing.T) {
+	type testcase struct {
+		output   string
+		added    []string
+		removed  []string
+		modified []string
+	}
+
+	kases := []testcase{
+		{
+			// Merge commit
+			output: "MM\x00options/locale/locale_en-US.ini\x00",
+			modified: []string{
+				"options/locale/locale_en-US.ini",
+			},
+			added:   []string{},
+			removed: []string{},
+		},
+		{
+			// Spaces commit
+			output: "D\x00b\x00D\x00b b/b\x00A\x00b b/b b/b b/b\x00A\x00b b/b b/b b/b b/b\x00",
+			removed: []string{
+				"b",
+				"b b/b",
+			},
+			modified: []string{},
+			added: []string{
+				"b b/b b/b b/b",
+				"b b/b b/b b/b b/b",
+			},
+		},
+		{
+			// larger commit
+			output: "M\x00go.mod\x00M\x00go.sum\x00M\x00modules/ssh/ssh.go\x00M\x00vendor/github.com/gliderlabs/ssh/circle.yml\x00M\x00vendor/github.com/gliderlabs/ssh/context.go\x00A\x00vendor/github.com/gliderlabs/ssh/go.mod\x00A\x00vendor/github.com/gliderlabs/ssh/go.sum\x00M\x00vendor/github.com/gliderlabs/ssh/server.go\x00M\x00vendor/github.com/gliderlabs/ssh/session.go\x00M\x00vendor/github.com/gliderlabs/ssh/ssh.go\x00M\x00vendor/golang.org/x/sys/unix/mkerrors.sh\x00M\x00vendor/golang.org/x/sys/unix/syscall_darwin.go\x00M\x00vendor/golang.org/x/sys/unix/zerrors_darwin_amd64.go\x00M\x00vendor/golang.org/x/sys/unix/zerrors_darwin_arm64.go\x00M\x00vendor/golang.org/x/sys/unix/zerrors_freebsd_386.go\x00M\x00vendor/golang.org/x/sys/unix/zerrors_freebsd_amd64.go\x00M\x00vendor/golang.org/x/sys/unix/zerrors_freebsd_arm.go\x00M\x00vendor/golang.org/x/sys/unix/zerrors_freebsd_arm64.go\x00M\x00vendor/golang.org/x/sys/unix/zerrors_linux.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_darwin_amd64.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_darwin_arm64.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_dragonfly_amd64.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_freebsd_386.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_freebsd_amd64.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_freebsd_arm.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_freebsd_arm64.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_netbsd_386.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_netbsd_amd64.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_netbsd_arm.go\x00M\x00vendor/golang.org/x/sys/unix/ztypes_netbsd_arm64.go\x00M\x00vendor/modules.txt\x00",
+			modified: []string{
+				"go.mod",
+				"go.sum",
+				"modules/ssh/ssh.go",
+				"vendor/github.com/gliderlabs/ssh/circle.yml",
+				"vendor/github.com/gliderlabs/ssh/context.go",
+				"vendor/github.com/gliderlabs/ssh/server.go",
+				"vendor/github.com/gliderlabs/ssh/session.go",
+				"vendor/github.com/gliderlabs/ssh/ssh.go",
+				"vendor/golang.org/x/sys/unix/mkerrors.sh",
+				"vendor/golang.org/x/sys/unix/syscall_darwin.go",
+				"vendor/golang.org/x/sys/unix/zerrors_darwin_amd64.go",
+				"vendor/golang.org/x/sys/unix/zerrors_darwin_arm64.go",
+				"vendor/golang.org/x/sys/unix/zerrors_freebsd_386.go",
+				"vendor/golang.org/x/sys/unix/zerrors_freebsd_amd64.go",
+				"vendor/golang.org/x/sys/unix/zerrors_freebsd_arm.go",
+				"vendor/golang.org/x/sys/unix/zerrors_freebsd_arm64.go",
+				"vendor/golang.org/x/sys/unix/zerrors_linux.go",
+				"vendor/golang.org/x/sys/unix/ztypes_darwin_amd64.go",
+				"vendor/golang.org/x/sys/unix/ztypes_darwin_arm64.go",
+				"vendor/golang.org/x/sys/unix/ztypes_dragonfly_amd64.go",
+				"vendor/golang.org/x/sys/unix/ztypes_freebsd_386.go",
+				"vendor/golang.org/x/sys/unix/ztypes_freebsd_amd64.go",
+				"vendor/golang.org/x/sys/unix/ztypes_freebsd_arm.go",
+				"vendor/golang.org/x/sys/unix/ztypes_freebsd_arm64.go",
+				"vendor/golang.org/x/sys/unix/ztypes_netbsd_386.go",
+				"vendor/golang.org/x/sys/unix/ztypes_netbsd_amd64.go",
+				"vendor/golang.org/x/sys/unix/ztypes_netbsd_arm.go",
+				"vendor/golang.org/x/sys/unix/ztypes_netbsd_arm64.go",
+				"vendor/modules.txt",
+			},
+			added: []string{
+				"vendor/github.com/gliderlabs/ssh/go.mod",
+				"vendor/github.com/gliderlabs/ssh/go.sum",
+			},
+			removed: []string{},
+		},
+		{
+			// git 1.7.2 adds an unnecessary \x00 on merge commit
+			output: "\x00MM\x00options/locale/locale_en-US.ini\x00",
+			modified: []string{
+				"options/locale/locale_en-US.ini",
+			},
+			added:   []string{},
+			removed: []string{},
+		},
+		{
+			// git 1.7.2 adds an unnecessary \n on normal commit
+			output: "\nD\x00b\x00D\x00b b/b\x00A\x00b b/b b/b b/b\x00A\x00b b/b b/b b/b b/b\x00",
+			removed: []string{
+				"b",
+				"b b/b",
+			},
+			modified: []string{},
+			added: []string{
+				"b b/b b/b b/b",
+				"b b/b b/b b/b b/b",
+			},
+		},
+	}
+
+	for _, kase := range kases {
+		fileStatus := NewCommitFileStatus()
+		parseCommitFileStatus(fileStatus, strings.NewReader(kase.output))
+
+		assert.Equal(t, kase.added, fileStatus.Added)
+		assert.Equal(t, kase.removed, fileStatus.Removed)
+		assert.Equal(t, kase.modified, fileStatus.Modified)
+	}
+}
+
+func TestGetCommitFileStatusMerges(t *testing.T) {
+	bareRepo1Path := filepath.Join(testReposDir, "repo6_merge")
+
+	commitFileStatus, err := GetCommitFileStatus(DefaultContext, bareRepo1Path, "022f4ce6214973e018f02bf363bf8a2e3691f699")
+	assert.NoError(t, err)
+
+	expected := CommitFileStatus{
+		[]string{
+			"add_file.txt",
+		},
+		[]string{
+			"to_remove.txt",
+		},
+		[]string{
+			"to_modify.txt",
+		},
+	}
+
+	assert.Equal(t, commitFileStatus.Added, expected.Added)
+	assert.Equal(t, commitFileStatus.Removed, expected.Removed)
+	assert.Equal(t, commitFileStatus.Modified, expected.Modified)
+}
+
+func Test_GetCommitBranchStart(t *testing.T) {
+	bareRepo1Path := filepath.Join(testReposDir, "repo1_bare")
+	repo, err := OpenRepository(context.Background(), bareRepo1Path)
+	assert.NoError(t, err)
+	defer repo.Close()
+	commit, err := repo.GetBranchCommit("branch1")
+	assert.NoError(t, err)
+	assert.EqualValues(t, "2839944139e0de9737a044f78b0e4b40d989a9e3", commit.ID.String())
+
+	startCommitID, err := repo.GetCommitBranchStart(os.Environ(), "branch1", commit.ID.String())
+	assert.NoError(t, err)
+	assert.NotEmpty(t, startCommitID)
+	assert.EqualValues(t, "9c9aef8dd84e02bc7ec12641deb4c930a7c30185", startCommitID)
 }

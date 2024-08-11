@@ -1,7 +1,6 @@
 // Copyright 2019 The Gitea Authors. All rights reserved.
 // Copyright 2015 The Gogs Authors. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// SPDX-License-Identifier: MIT
 
 package git
 
@@ -52,9 +51,7 @@ func getRefURL(refURL, urlPrefix, repoFullName, sshDomain string) string {
 		urlPrefixHostname = prefixURL.Host
 	}
 
-	if strings.HasSuffix(urlPrefix, "/") {
-		urlPrefix = urlPrefix[:len(urlPrefix)-1]
-	}
+	urlPrefix = strings.TrimSuffix(urlPrefix, "/")
 
 	// FIXME: Need to consider branch - which will require changes in modules/git/commit.go:GetSubModules
 	// Relative url prefix check (according to git submodule documentation)
@@ -67,7 +64,6 @@ func getRefURL(refURL, urlPrefix, repoFullName, sshDomain string) string {
 		// ex: git@try.gitea.io:go-gitea/gitea
 		match := scpSyntax.FindAllStringSubmatch(refURI, -1)
 		if len(match) > 0 {
-
 			m := match[0]
 			refHostname := m[2]
 			pth := m[3]
@@ -104,9 +100,8 @@ func getRefURL(refURL, urlPrefix, repoFullName, sshDomain string) string {
 				return ref.Scheme + "://" + ref.Host + ref.Path
 			} else if urlPrefixHostname == refHostname || refHostname == sshDomain {
 				return urlPrefix + path.Clean(path.Join("/", ref.Path))
-			} else {
-				return "http://" + refHostname + ref.Path
 			}
+			return "http://" + refHostname + ref.Path
 		}
 	}
 
