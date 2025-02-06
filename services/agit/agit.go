@@ -137,8 +137,12 @@ func ProcReceive(ctx context.Context, repo *repo_model.Repository, gitRepo *git.
 				Type:         issues_model.PullRequestGitea,
 				Flow:         issues_model.PullRequestFlowAGit,
 			}
-
-			if err := pull_service.NewPullRequest(ctx, repo, prIssue, []int64{}, []string{}, pr, []int64{}); err != nil {
+			prOpts := &pull_service.NewPullRequestOptions{
+				Repo:        repo,
+				Issue:       prIssue,
+				PullRequest: pr,
+			}
+			if err := pull_service.NewPullRequest(ctx, prOpts); err != nil {
 				return nil, err
 			}
 
@@ -149,7 +153,7 @@ func ProcReceive(ctx context.Context, repo *repo_model.Repository, gitRepo *git.
 				OriginalRef:       opts.RefFullNames[i],
 				OldOID:            objectFormat.EmptyObjectID().String(),
 				NewOID:            opts.NewCommitIDs[i],
-				IsCreatePR:        true,
+				IsCreatePR:        false, // AGit always creates a pull request so there is no point in prompting user to create one
 				URL:               fmt.Sprintf("%s/pulls/%d", repo.HTMLURL(), pr.Index),
 				ShouldShowMessage: setting.Git.PullRequestPushMessage && repo.AllowsPulls(ctx),
 				HeadBranch:        headBranch,

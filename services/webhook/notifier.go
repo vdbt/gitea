@@ -6,7 +6,9 @@ package webhook
 import (
 	"context"
 
+	git_model "code.gitea.io/gitea/models/git"
 	issues_model "code.gitea.io/gitea/models/issues"
+	"code.gitea.io/gitea/models/organization"
 	packages_model "code.gitea.io/gitea/models/packages"
 	"code.gitea.io/gitea/models/perm"
 	access_model "code.gitea.io/gitea/models/perm/access"
@@ -409,6 +411,10 @@ func (m *webhookNotifier) CreateIssueComment(ctx context.Context, doer *user_mod
 	var pullRequest *api.PullRequest
 	if issue.IsPull {
 		eventType = webhook_module.HookEventPullRequestComment
+		if err := issue.LoadPullRequest(ctx); err != nil {
+			log.Error("LoadPullRequest: %v", err)
+			return
+		}
 		pullRequest = convert.ToAPIPullRequest(ctx, issue.PullRequest, doer)
 	} else {
 		eventType = webhook_module.HookEventIssueComment
@@ -758,12 +764,10 @@ func (m *webhookNotifier) PullRequestReviewRequest(ctx context.Context, doer *us
 func (m *webhookNotifier) CreateRef(ctx context.Context, pusher *user_model.User, repo *repo_model.Repository, refFullName git.RefName, refID string) {
 	apiPusher := convert.ToUser(ctx, pusher, nil)
 	apiRepo := convert.ToRepo(ctx, repo, access_model.Permission{AccessMode: perm.AccessModeNone})
-	refName := refFullName.ShortName()
-
 	if err := PrepareWebhooks(ctx, EventSource{Repository: repo}, webhook_module.HookEventCreate, &api.CreatePayload{
-		Ref:     refName, // FIXME: should it be a full ref name?
+		Ref:     refFullName.ShortName(), // FIXME: should it be a full ref name? But it will break the existing webhooks?
 		Sha:     refID,
-		RefType: refFullName.RefType(),
+		RefType: string(refFullName.RefType()),
 		Repo:    apiRepo,
 		Sender:  apiPusher,
 	}); err != nil {
@@ -795,11 +799,9 @@ func (m *webhookNotifier) PullRequestSynchronized(ctx context.Context, doer *use
 func (m *webhookNotifier) DeleteRef(ctx context.Context, pusher *user_model.User, repo *repo_model.Repository, refFullName git.RefName) {
 	apiPusher := convert.ToUser(ctx, pusher, nil)
 	apiRepo := convert.ToRepo(ctx, repo, access_model.Permission{AccessMode: perm.AccessModeOwner})
-	refName := refFullName.ShortName()
-
 	if err := PrepareWebhooks(ctx, EventSource{Repository: repo}, webhook_module.HookEventDelete, &api.DeletePayload{
-		Ref:        refName, // FIXME: should it be a full ref name?
-		RefType:    refFullName.RefType(),
+		Ref:        refFullName.ShortName(), // FIXME: should it be a full ref name? But it will break the existing webhooks?
+		RefType:    string(refFullName.RefType()),
 		PusherType: api.PusherTypeUser,
 		Repo:       apiRepo,
 		Sender:     apiPusher,
@@ -861,6 +863,36 @@ func (m *webhookNotifier) SyncPushCommits(ctx context.Context, pusher *user_mode
 	}
 }
 
+func (m *webhookNotifier) CreateCommitStatus(ctx context.Context, repo *repo_model.Repository, commit *repository.PushCommit, sender *user_model.User, status *git_model.CommitStatus) {
+	apiSender := convert.ToUser(ctx, sender, nil)
+	apiCommit, err := repository.ToAPIPayloadCommit(ctx, map[string]*user_model.User{}, repo.RepoPath(), repo.HTMLURL(), commit)
+	if err != nil {
+		log.Error("commits.ToAPIPayloadCommits failed: %v", err)
+		return
+	}
+
+	payload := api.CommitStatusPayload{
+		Context:     status.Context,
+		CreatedAt:   status.CreatedUnix.AsTime().UTC(),
+		Description: status.Description,
+		ID:          status.ID,
+		SHA:         commit.Sha1,
+		State:       status.State.String(),
+		TargetURL:   status.TargetURL,
+
+		Commit: apiCommit,
+		Repo:   convert.ToRepo(ctx, repo, access_model.Permission{AccessMode: perm.AccessModeOwner}),
+		Sender: apiSender,
+	}
+	if !status.UpdatedUnix.IsZero() {
+		t := status.UpdatedUnix.AsTime().UTC()
+		payload.UpdatedAt = &t
+	}
+	if err := PrepareWebhooks(ctx, EventSource{Repository: repo}, webhook_module.HookEventStatus, &payload); err != nil {
+		log.Error("PrepareWebhooks: %v", err)
+	}
+}
+
 func (m *webhookNotifier) SyncCreateRef(ctx context.Context, pusher *user_model.User, repo *repo_model.Repository, refFullName git.RefName, refID string) {
 	m.CreateRef(ctx, pusher, repo, refFullName, refID)
 }
@@ -889,10 +921,16 @@ func notifyPackage(ctx context.Context, sender *user_model.User, pd *packages_mo
 		return
 	}
 
+	var org *api.Organization
+	if pd.Owner.IsOrganization() {
+		org = convert.ToOrganization(ctx, organization.OrgFromUser(pd.Owner))
+	}
+
 	if err := PrepareWebhooks(ctx, source, webhook_module.HookEventPackage, &api.PackagePayload{
-		Action:  action,
-		Package: apiPackage,
-		Sender:  convert.ToUser(ctx, sender, nil),
+		Action:       action,
+		Package:      apiPackage,
+		Organization: org,
+		Sender:       convert.ToUser(ctx, sender, nil),
 	}); err != nil {
 		log.Error("PrepareWebhooks: %v", err)
 	}

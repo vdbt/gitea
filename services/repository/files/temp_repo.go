@@ -13,13 +13,13 @@ import (
 	"strings"
 	"time"
 
-	"code.gitea.io/gitea/models"
 	repo_model "code.gitea.io/gitea/models/repo"
 	user_model "code.gitea.io/gitea/models/user"
 	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/log"
 	repo_module "code.gitea.io/gitea/modules/repository"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/modules/util"
 	asymkey_service "code.gitea.io/gitea/services/asymkey"
 	"code.gitea.io/gitea/services/gitdiff"
 )
@@ -187,7 +187,7 @@ func (t *TemporaryUploadRepository) AddObjectToIndex(mode, objectHash, objectPat
 	if _, _, err := git.NewCommand(t.ctx, "update-index", "--add", "--replace", "--cacheinfo").AddDynamicArguments(mode, objectHash, objectPath).RunStdString(&git.RunOpts{Dir: t.basePath}); err != nil {
 		stderr := err.Error()
 		if matched, _ := regexp.MatchString(".*Invalid path '.*", stderr); matched {
-			return models.ErrFilePathInvalid{
+			return ErrFilePathInvalid{
 				Message: objectPath,
 				Path:    objectPath,
 			}
@@ -226,15 +226,53 @@ func (t *TemporaryUploadRepository) GetLastCommitByRef(ref string) (string, erro
 	return strings.TrimSpace(stdout), nil
 }
 
-// CommitTree creates a commit from a given tree for the user with provided message
-func (t *TemporaryUploadRepository) CommitTree(parent string, author, committer *user_model.User, treeHash, message string, signoff bool) (string, error) {
-	return t.CommitTreeWithDate(parent, author, committer, treeHash, message, signoff, time.Now(), time.Now())
+type CommitTreeUserOptions struct {
+	ParentCommitID string
+	TreeHash       string
+	CommitMessage  string
+	SignOff        bool
+
+	DoerUser *user_model.User
+
+	AuthorIdentity    *IdentityOptions // if nil, use doer
+	AuthorTime        *time.Time       // if nil, use now
+	CommitterIdentity *IdentityOptions
+	CommitterTime     *time.Time
 }
 
-// CommitTreeWithDate creates a commit from a given tree for the user with provided message
-func (t *TemporaryUploadRepository) CommitTreeWithDate(parent string, author, committer *user_model.User, treeHash, message string, signoff bool, authorDate, committerDate time.Time) (string, error) {
-	authorSig := author.NewGitSig()
-	committerSig := committer.NewGitSig()
+func makeGitUserSignature(doer *user_model.User, identity, other *IdentityOptions) *git.Signature {
+	gitSig := &git.Signature{}
+	if identity != nil {
+		gitSig.Name, gitSig.Email = identity.GitUserName, identity.GitUserEmail
+	}
+	if other != nil {
+		gitSig.Name = util.IfZero(gitSig.Name, other.GitUserName)
+		gitSig.Email = util.IfZero(gitSig.Email, other.GitUserEmail)
+	}
+	if gitSig.Name == "" {
+		gitSig.Name = doer.GitName()
+	}
+	if gitSig.Email == "" {
+		gitSig.Email = doer.GetEmail()
+	}
+	return gitSig
+}
+
+// CommitTree creates a commit from a given tree for the user with provided message
+func (t *TemporaryUploadRepository) CommitTree(opts *CommitTreeUserOptions) (string, error) {
+	authorSig := makeGitUserSignature(opts.DoerUser, opts.AuthorIdentity, opts.CommitterIdentity)
+	committerSig := makeGitUserSignature(opts.DoerUser, opts.CommitterIdentity, opts.AuthorIdentity)
+
+	authorDate := opts.AuthorTime
+	committerDate := opts.CommitterTime
+	if authorDate == nil && committerDate == nil {
+		authorDate = util.ToPointer(time.Now())
+		committerDate = authorDate
+	} else if authorDate == nil {
+		authorDate = committerDate
+	} else if committerDate == nil {
+		committerDate = authorDate
+	}
 
 	// Because this may call hooks we should pass in the environment
 	env := append(os.Environ(),
@@ -245,21 +283,21 @@ func (t *TemporaryUploadRepository) CommitTreeWithDate(parent string, author, co
 	)
 
 	messageBytes := new(bytes.Buffer)
-	_, _ = messageBytes.WriteString(message)
+	_, _ = messageBytes.WriteString(opts.CommitMessage)
 	_, _ = messageBytes.WriteString("\n")
 
-	cmdCommitTree := git.NewCommand(t.ctx, "commit-tree").AddDynamicArguments(treeHash)
-	if parent != "" {
-		cmdCommitTree.AddOptionValues("-p", parent)
+	cmdCommitTree := git.NewCommand(t.ctx, "commit-tree").AddDynamicArguments(opts.TreeHash)
+	if opts.ParentCommitID != "" {
+		cmdCommitTree.AddOptionValues("-p", opts.ParentCommitID)
 	}
 
 	var sign bool
 	var keyID string
 	var signer *git.Signature
-	if parent != "" {
-		sign, keyID, signer, _ = asymkey_service.SignCRUDAction(t.ctx, t.repo.RepoPath(), author, t.basePath, parent)
+	if opts.ParentCommitID != "" {
+		sign, keyID, signer, _ = asymkey_service.SignCRUDAction(t.ctx, t.repo.RepoPath(), opts.DoerUser, t.basePath, opts.ParentCommitID)
 	} else {
-		sign, keyID, signer, _ = asymkey_service.SignInitialCommit(t.ctx, t.repo.RepoPath(), author)
+		sign, keyID, signer, _ = asymkey_service.SignInitialCommit(t.ctx, t.repo.RepoPath(), opts.DoerUser)
 	}
 	if sign {
 		cmdCommitTree.AddOptionFormat("-S%s", keyID)
@@ -280,7 +318,7 @@ func (t *TemporaryUploadRepository) CommitTreeWithDate(parent string, author, co
 		cmdCommitTree.AddArguments("--no-gpg-sign")
 	}
 
-	if signoff {
+	if opts.SignOff {
 		// Signed-off-by
 		_, _ = messageBytes.WriteString("\n")
 		_, _ = messageBytes.WriteString("Signed-off-by: ")
@@ -339,8 +377,7 @@ func (t *TemporaryUploadRepository) Push(doer *user_model.User, commitHash, bran
 func (t *TemporaryUploadRepository) DiffIndex() (*gitdiff.Diff, error) {
 	stdoutReader, stdoutWriter, err := os.Pipe()
 	if err != nil {
-		log.Error("Unable to open stdout pipe: %v", err)
-		return nil, fmt.Errorf("Unable to open stdout pipe: %w", err)
+		return nil, fmt.Errorf("unable to open stdout pipe: %w", err)
 	}
 	defer func() {
 		_ = stdoutReader.Close()
@@ -348,9 +385,7 @@ func (t *TemporaryUploadRepository) DiffIndex() (*gitdiff.Diff, error) {
 	}()
 	stderr := new(bytes.Buffer)
 	var diff *gitdiff.Diff
-	var finalErr error
-
-	if err := git.NewCommand(t.ctx, "diff-index", "--src-prefix=\\a/", "--dst-prefix=\\b/", "--cached", "-p", "HEAD").
+	err = git.NewCommand(t.ctx, "diff-index", "--src-prefix=\\a/", "--dst-prefix=\\b/", "--cached", "-p", "HEAD").
 		Run(&git.RunOpts{
 			Timeout: 30 * time.Second,
 			Dir:     t.basePath,
@@ -358,23 +393,20 @@ func (t *TemporaryUploadRepository) DiffIndex() (*gitdiff.Diff, error) {
 			Stderr:  stderr,
 			PipelineFunc: func(ctx context.Context, cancel context.CancelFunc) error {
 				_ = stdoutWriter.Close()
-				diff, finalErr = gitdiff.ParsePatch(t.ctx, setting.Git.MaxGitDiffLines, setting.Git.MaxGitDiffLineCharacters, setting.Git.MaxGitDiffFiles, stdoutReader, "")
-				if finalErr != nil {
-					log.Error("ParsePatch: %v", finalErr)
-					cancel()
-				}
+				defer cancel()
+				var diffErr error
+				diff, diffErr = gitdiff.ParsePatch(t.ctx, setting.Git.MaxGitDiffLines, setting.Git.MaxGitDiffLineCharacters, setting.Git.MaxGitDiffFiles, stdoutReader, "")
 				_ = stdoutReader.Close()
-				return finalErr
+				if diffErr != nil {
+					// if the diffErr is not nil, it will be returned as the error of "Run()"
+					return fmt.Errorf("ParsePatch: %w", diffErr)
+				}
+				return nil
 			},
-		}); err != nil {
-		if finalErr != nil {
-			log.Error("Unable to ParsePatch in temporary repo %s (%s). Error: %v", t.repo.FullName(), t.basePath, finalErr)
-			return nil, finalErr
-		}
-		log.Error("Unable to run diff-index pipeline in temporary repo %s (%s). Error: %v\nStderr: %s",
-			t.repo.FullName(), t.basePath, err, stderr)
-		return nil, fmt.Errorf("Unable to run diff-index pipeline in temporary repo %s. Error: %w\nStderr: %s",
-			t.repo.FullName(), err, stderr)
+		})
+	if err != nil && !git.IsErrCanceledOrKilled(err) {
+		log.Error("Unable to diff-index in temporary repo %s (%s). Error: %v\nStderr: %s", t.repo.FullName(), t.basePath, err, stderr)
+		return nil, fmt.Errorf("unable to run diff-index pipeline in temporary repo: %w", err)
 	}
 
 	diff.NumFiles, diff.TotalAddition, diff.TotalDeletion, err = git.GetDiffShortStat(t.ctx, t.basePath, git.TrustedCmdArgs{"--cached"}, "HEAD")
