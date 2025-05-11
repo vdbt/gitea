@@ -119,6 +119,9 @@ type swaggerParameterBodies struct {
 	EditAttachmentOptions api.EditAttachmentOptions
 
 	// in:body
+	GetFilesOptions api.GetFilesOptions
+
+	// in:body
 	ChangeFilesOptions api.ChangeFilesOptions
 
 	// in:body
@@ -212,5 +215,11 @@ type swaggerParameterBodies struct {
 	RenameOrgOption api.RenameOrgOption
 
 	// in:body
+	CreateActionWorkflowDispatch api.CreateActionWorkflowDispatch
+
+	// in:body
 	UpdateVariableOption api.UpdateVariableOption
+
+	// in:body
+	LockIssueOption api.LockIssueOption
 }

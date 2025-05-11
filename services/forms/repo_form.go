@@ -10,7 +10,6 @@ import (
 
 	issues_model "code.gitea.io/gitea/models/issues"
 	project_model "code.gitea.io/gitea/models/project"
-	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/web/middleware"
 	"code.gitea.io/gitea/services/context"
@@ -110,17 +109,14 @@ type RepoSettingForm struct {
 	EnablePrune            bool
 
 	// Advanced settings
-	EnableCode                bool
-	DefaultCodeEveryoneAccess string
+	EnableCode bool
 
-	EnableWiki                bool
-	EnableExternalWiki        bool
-	DefaultWikiBranch         string
-	DefaultWikiEveryoneAccess string
-	ExternalWikiURL           string
+	EnableWiki         bool
+	EnableExternalWiki bool
+	DefaultWikiBranch  string
+	ExternalWikiURL    string
 
 	EnableIssues                          bool
-	DefaultIssuesEveryoneAccess           string
 	EnableExternalTracker                 bool
 	ExternalTrackerURL                    string
 	TrackerURLFormat                      string
@@ -169,13 +165,6 @@ func (f *RepoSettingForm) Validate(req *http.Request, errs binding.Errors) bindi
 	ctx := context.GetValidateContext(req)
 	return middleware.Validate(errs, ctx.Data, f, ctx.Locale)
 }
-
-// __________                             .__
-// \______   \____________    ____   ____ |  |__
-//  |    |  _/\_  __ \__  \  /    \_/ ___\|  |  \
-//  |    |   \ |  | \// __ \|   |  \  \___|   Y  \
-//  |______  / |__|  (____  /___|  /\___  >___|  /
-//         \/             \/     \/     \/     \/
 
 // ProtectBranchForm form for changing protected branch settings
 type ProtectBranchForm struct {
@@ -244,6 +233,7 @@ type WebhookForm struct {
 	Release                  bool
 	Package                  bool
 	Status                   bool
+	WorkflowJob              bool
 	Active                   bool
 	BranchFilter             string `binding:"GlobPattern"`
 	AuthorizationHeader      string
@@ -482,22 +472,6 @@ func (i *IssueLockForm) Validate(req *http.Request, errs binding.Errors) binding
 	return middleware.Validate(errs, ctx.Data, i, ctx.Locale)
 }
 
-// HasValidReason checks to make sure that the reason submitted in
-// the form matches any of the values in the config
-func (i IssueLockForm) HasValidReason() bool {
-	if strings.TrimSpace(i.Reason) == "" {
-		return true
-	}
-
-	for _, v := range setting.Repository.Issue.LockReasons {
-		if v == i.Reason {
-			return true
-		}
-	}
-
-	return false
-}
-
 // CreateProjectForm form for creating a project
 type CreateProjectForm struct {
 	Title        string `binding:"Required;MaxSize(100)"`
@@ -528,12 +502,13 @@ func (f *CreateMilestoneForm) Validate(req *http.Request, errs binding.Errors) b
 
 // CreateLabelForm form for creating label
 type CreateLabelForm struct {
-	ID          int64
-	Title       string `binding:"Required;MaxSize(50)" locale:"repo.issues.label_title"`
-	Exclusive   bool   `form:"exclusive"`
-	IsArchived  bool   `form:"is_archived"`
-	Description string `binding:"MaxSize(200)" locale:"repo.issues.label_description"`
-	Color       string `binding:"Required;MaxSize(7)" locale:"repo.issues.label_color"`
+	ID             int64
+	Title          string `binding:"Required;MaxSize(50)" locale:"repo.issues.label_title"`
+	Exclusive      bool   `form:"exclusive"`
+	ExclusiveOrder int    `form:"exclusive_order"`
+	IsArchived     bool   `form:"is_archived"`
+	Description    string `binding:"MaxSize(200)" locale:"repo.issues.label_description"`
+	Color          string `binding:"Required;MaxSize(7)" locale:"repo.issues.label_color"`
 }
 
 // Validate validates the fields

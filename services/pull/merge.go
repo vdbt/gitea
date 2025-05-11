@@ -6,6 +6,7 @@ package pull
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,7 +60,7 @@ func getMergeMessage(ctx context.Context, baseGitRepo *git.Repository, pr *issue
 		issueReference = "!"
 	}
 
-	reviewedOn := fmt.Sprintf("Reviewed-on: %s", httplib.MakeAbsoluteURL(ctx, pr.Issue.Link()))
+	reviewedOn := "Reviewed-on: " + httplib.MakeAbsoluteURL(ctx, pr.Issue.Link())
 	reviewedBy := pr.GetApprovers(ctx)
 
 	if mergeStyle != "" {
@@ -211,7 +212,15 @@ func Merge(ctx context.Context, pr *issues_model.PullRequest, doer *user_model.U
 	}
 	defer releaser()
 	defer func() {
-		go AddTestPullRequestTask(doer, pr.BaseRepo.ID, pr.BaseBranch, false, "", "")
+		go AddTestPullRequestTask(TestPullRequestOptions{
+			RepoID:      pr.BaseRepo.ID,
+			Doer:        doer,
+			Branch:      pr.BaseBranch,
+			IsSync:      false,
+			IsForcePush: false,
+			OldCommitID: "",
+			NewCommitID: "",
+		})
 	}()
 
 	_, err = doMergeAndPush(ctx, pr, doer, mergeStyle, expectedHeadCommitID, message, repo_module.PushTriggerPRMergeToBase)
@@ -356,12 +365,12 @@ func doMergeAndPush(ctx context.Context, pr *issues_model.PullRequest, doer *use
 	)
 
 	mergeCtx.env = append(mergeCtx.env, repo_module.EnvPushTrigger+"="+string(pushTrigger))
-	pushCmd := git.NewCommand(ctx, "push", "origin").AddDynamicArguments(baseBranch + ":" + git.BranchPrefix + pr.BaseBranch)
+	pushCmd := git.NewCommand("push", "origin").AddDynamicArguments(baseBranch + ":" + git.BranchPrefix + pr.BaseBranch)
 
 	// Push back to upstream.
 	// This cause an api call to "/api/internal/hook/post-receive/...",
 	// If it's merge, all db transaction and operations should be there but not here to prevent deadlock.
-	if err := pushCmd.Run(mergeCtx.RunOpts()); err != nil {
+	if err := pushCmd.Run(ctx, mergeCtx.RunOpts()); err != nil {
 		if strings.Contains(mergeCtx.errbuf.String(), "non-fast-forward") {
 			return "", &git.ErrPushOutOfDate{
 				StdOut: mergeCtx.outbuf.String(),
@@ -386,13 +395,13 @@ func doMergeAndPush(ctx context.Context, pr *issues_model.PullRequest, doer *use
 }
 
 func commitAndSignNoAuthor(ctx *mergeContext, message string) error {
-	cmdCommit := git.NewCommand(ctx, "commit").AddOptionFormat("--message=%s", message)
+	cmdCommit := git.NewCommand("commit").AddOptionFormat("--message=%s", message)
 	if ctx.signKeyID == "" {
 		cmdCommit.AddArguments("--no-gpg-sign")
 	} else {
 		cmdCommit.AddOptionFormat("-S%s", ctx.signKeyID)
 	}
-	if err := cmdCommit.Run(ctx.RunOpts()); err != nil {
+	if err := cmdCommit.Run(ctx, ctx.RunOpts()); err != nil {
 		log.Error("git commit %-v: %v\n%s\n%s", ctx.pr, err, ctx.outbuf.String(), ctx.errbuf.String())
 		return fmt.Errorf("git commit %v: %w\n%s\n%s", ctx.pr, err, ctx.outbuf.String(), ctx.errbuf.String())
 	}
@@ -453,7 +462,7 @@ func (err ErrMergeDivergingFastForwardOnly) Error() string {
 }
 
 func runMergeCommand(ctx *mergeContext, mergeStyle repo_model.MergeStyle, cmd *git.Command) error {
-	if err := cmd.Run(ctx.RunOpts()); err != nil {
+	if err := cmd.Run(ctx, ctx.RunOpts()); err != nil {
 		// Merge will leave a MERGE_HEAD file in the .git folder if there is a conflict
 		if _, statErr := os.Stat(filepath.Join(ctx.tmpBasePath, ".git", "MERGE_HEAD")); statErr == nil {
 			// We have a merge conflict error
@@ -509,25 +518,6 @@ func IsUserAllowedToMerge(ctx context.Context, pr *issues_model.PullRequest, p a
 	return false, nil
 }
 
-// ErrDisallowedToMerge represents an error that a branch is protected and the current user is not allowed to modify it.
-type ErrDisallowedToMerge struct {
-	Reason string
-}
-
-// IsErrDisallowedToMerge checks if an error is an ErrDisallowedToMerge.
-func IsErrDisallowedToMerge(err error) bool {
-	_, ok := err.(ErrDisallowedToMerge)
-	return ok
-}
-
-func (err ErrDisallowedToMerge) Error() string {
-	return fmt.Sprintf("not allowed to merge [reason: %s]", err.Reason)
-}
-
-func (err ErrDisallowedToMerge) Unwrap() error {
-	return util.ErrPermissionDenied
-}
-
 // CheckPullBranchProtections checks whether the PR is ready to be merged (reviews and status checks)
 func CheckPullBranchProtections(ctx context.Context, pr *issues_model.PullRequest, skipProtectedFilesCheck bool) (err error) {
 	if err = pr.LoadBaseRepo(ctx); err != nil {
@@ -547,31 +537,21 @@ func CheckPullBranchProtections(ctx context.Context, pr *issues_model.PullReques
 		return err
 	}
 	if !isPass {
-		return ErrDisallowedToMerge{
-			Reason: "Not all required status checks successful",
-		}
+		return util.ErrorWrap(ErrNotReadyToMerge, "Not all required status checks successful")
 	}
 
 	if !issues_model.HasEnoughApprovals(ctx, pb, pr) {
-		return ErrDisallowedToMerge{
-			Reason: "Does not have enough approvals",
-		}
+		return util.ErrorWrap(ErrNotReadyToMerge, "Does not have enough approvals")
 	}
 	if issues_model.MergeBlockedByRejectedReview(ctx, pb, pr) {
-		return ErrDisallowedToMerge{
-			Reason: "There are requested changes",
-		}
+		return util.ErrorWrap(ErrNotReadyToMerge, "There are requested changes")
 	}
 	if issues_model.MergeBlockedByOfficialReviewRequests(ctx, pb, pr) {
-		return ErrDisallowedToMerge{
-			Reason: "There are official review requests",
-		}
+		return util.ErrorWrap(ErrNotReadyToMerge, "There are official review requests")
 	}
 
 	if issues_model.MergeBlockedByOutdatedBranch(pb, pr) {
-		return ErrDisallowedToMerge{
-			Reason: "The head branch is behind the base branch",
-		}
+		return util.ErrorWrap(ErrNotReadyToMerge, "The head branch is behind the base branch")
 	}
 
 	if skipProtectedFilesCheck {
@@ -579,9 +559,7 @@ func CheckPullBranchProtections(ctx context.Context, pr *issues_model.PullReques
 	}
 
 	if pb.MergeBlockedByProtectedFiles(pr.ChangedProtectedFiles) {
-		return ErrDisallowedToMerge{
-			Reason: "Changed protected files",
-		}
+		return util.ErrorWrap(ErrNotReadyToMerge, "Changed protected files")
 	}
 
 	return nil
@@ -613,13 +591,13 @@ func MergedManually(ctx context.Context, pr *issues_model.PullRequest, doer *use
 
 		objectFormat := git.ObjectFormatFromName(pr.BaseRepo.ObjectFormatName)
 		if len(commitID) != objectFormat.FullLength() {
-			return fmt.Errorf("Wrong commit ID")
+			return errors.New("Wrong commit ID")
 		}
 
 		commit, err := baseGitRepo.GetCommit(commitID)
 		if err != nil {
 			if git.IsErrNotExist(err) {
-				return fmt.Errorf("Wrong commit ID")
+				return errors.New("Wrong commit ID")
 			}
 			return err
 		}
@@ -630,14 +608,14 @@ func MergedManually(ctx context.Context, pr *issues_model.PullRequest, doer *use
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("Wrong commit ID")
+			return errors.New("Wrong commit ID")
 		}
 
 		var merged bool
 		if merged, err = SetMerged(ctx, pr, commitID, timeutil.TimeStamp(commit.Author.When.Unix()), doer, issues_model.PullRequestStatusManuallyMerged); err != nil {
 			return err
 		} else if !merged {
-			return fmt.Errorf("SetMerged failed")
+			return errors.New("SetMerged failed")
 		}
 		return nil
 	})
@@ -700,7 +678,7 @@ func SetMerged(ctx context.Context, pr *issues_model.PullRequest, mergedCommitID
 		return false, fmt.Errorf("ChangeIssueStatus: %w", err)
 	}
 
-	// We need to save all of the data used to compute this merge as it may have already been changed by TestPatch. FIXME: need to set some state to prevent TestPatch from running whilst we are merging.
+	// We need to save all of the data used to compute this merge as it may have already been changed by testPullRequestBranchMergeable. FIXME: need to set some state to prevent testPullRequestBranchMergeable from running whilst we are merging.
 	if cnt, err := db.GetEngine(ctx).Where("id = ?", pr.ID).
 		And("has_merged = ?", false).
 		Cols("has_merged, status, merge_base, merged_commit_id, merger_id, merged_unix, conflicted_files").

@@ -4,7 +4,6 @@
 package user_test
 
 import (
-	"context"
 	"crypto/rand"
 	"fmt"
 	"strings"
@@ -20,9 +19,11 @@ import (
 	"code.gitea.io/gitea/modules/optional"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/structs"
+	"code.gitea.io/gitea/modules/test"
 	"code.gitea.io/gitea/modules/timeutil"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsUsableUsername(t *testing.T) {
@@ -48,14 +49,23 @@ func TestOAuth2Application_LoadUser(t *testing.T) {
 	assert.NotNil(t, user)
 }
 
-func TestGetUserEmailsByNames(t *testing.T) {
+func TestUserEmails(t *testing.T) {
 	assert.NoError(t, unittest.PrepareTestDatabase())
-
-	// ignore none active user email
-	assert.ElementsMatch(t, []string{"user8@example.com"}, user_model.GetUserEmailsByNames(db.DefaultContext, []string{"user8", "user9"}))
-	assert.ElementsMatch(t, []string{"user8@example.com", "user5@example.com"}, user_model.GetUserEmailsByNames(db.DefaultContext, []string{"user8", "user5"}))
-
-	assert.ElementsMatch(t, []string{"user8@example.com"}, user_model.GetUserEmailsByNames(db.DefaultContext, []string{"user8", "org7"}))
+	t.Run("GetUserEmailsByNames", func(t *testing.T) {
+		// ignore none active user email
+		assert.ElementsMatch(t, []string{"user8@example.com"}, user_model.GetUserEmailsByNames(db.DefaultContext, []string{"user8", "user9"}))
+		assert.ElementsMatch(t, []string{"user8@example.com", "user5@example.com"}, user_model.GetUserEmailsByNames(db.DefaultContext, []string{"user8", "user5"}))
+		assert.ElementsMatch(t, []string{"user8@example.com"}, user_model.GetUserEmailsByNames(db.DefaultContext, []string{"user8", "org7"}))
+	})
+	t.Run("GetUsersByEmails", func(t *testing.T) {
+		m, err := user_model.GetUsersByEmails(db.DefaultContext, []string{"user1@example.com", "user2@" + setting.Service.NoReplyAddress})
+		require.NoError(t, err)
+		require.Len(t, m, 4)
+		assert.EqualValues(t, 1, m["user1@example.com"].ID)
+		assert.EqualValues(t, 1, m["user1@"+setting.Service.NoReplyAddress].ID)
+		assert.EqualValues(t, 2, m["user2@example.com"].ID)
+		assert.EqualValues(t, 2, m["user2@"+setting.Service.NoReplyAddress].ID)
+	})
 }
 
 func TestCanCreateOrganization(t *testing.T) {
@@ -84,7 +94,7 @@ func TestSearchUsers(t *testing.T) {
 		cassText := fmt.Sprintf("ids: %v, opts: %v", expectedUserOrOrgIDs, opts)
 		if assert.Len(t, users, len(expectedUserOrOrgIDs), "case: %s", cassText) {
 			for i, expectedID := range expectedUserOrOrgIDs {
-				assert.EqualValues(t, expectedID, users[i].ID, "case: %s", cassText)
+				assert.Equal(t, expectedID, users[i].ID, "case: %s", cassText)
 			}
 		}
 	}
@@ -201,7 +211,7 @@ func BenchmarkHashPassword(b *testing.B) {
 	pass := "password1337"
 	u := &user_model.User{Passwd: pass}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		u.SetPassword(pass)
 	}
 }
@@ -279,7 +289,7 @@ func TestCreateUserCustomTimestamps(t *testing.T) {
 	err := user_model.CreateUser(db.DefaultContext, user, &user_model.Meta{})
 	assert.NoError(t, err)
 
-	fetched, err := user_model.GetUserByID(context.Background(), user.ID)
+	fetched, err := user_model.GetUserByID(t.Context(), user.ID)
 	assert.NoError(t, err)
 	assert.Equal(t, creationTimestamp, fetched.CreatedUnix)
 	assert.Equal(t, creationTimestamp, fetched.UpdatedUnix)
@@ -306,7 +316,7 @@ func TestCreateUserWithoutCustomTimestamps(t *testing.T) {
 
 	timestampEnd := time.Now().Unix()
 
-	fetched, err := user_model.GetUserByID(context.Background(), user.ID)
+	fetched, err := user_model.GetUserByID(t.Context(), user.ID)
 	assert.NoError(t, err)
 
 	assert.LessOrEqual(t, timestampStart, fetched.CreatedUnix)
@@ -514,7 +524,7 @@ func Test_ValidateUser(t *testing.T) {
 		{ID: 2, Visibility: structs.VisibleTypePrivate}: true,
 	}
 	for kase, expected := range kases {
-		assert.EqualValues(t, expected, nil == user_model.ValidateUser(kase), "case: %+v", kase)
+		assert.Equal(t, expected, nil == user_model.ValidateUser(kase), "case: %+v", kase)
 	}
 }
 
@@ -538,7 +548,7 @@ func Test_NormalizeUserFromEmail(t *testing.T) {
 	for _, testCase := range testCases {
 		normalizedName, err := user_model.NormalizeUserName(testCase.Input)
 		assert.NoError(t, err)
-		assert.EqualValues(t, testCase.Expected, normalizedName)
+		assert.Equal(t, testCase.Expected, normalizedName)
 		if testCase.IsNormalizedValid {
 			assert.NoError(t, user_model.IsUsableUsername(normalizedName))
 		} else {
@@ -565,7 +575,7 @@ func TestEmailTo(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.result, func(t *testing.T) {
 			testUser := &user_model.User{FullName: testCase.fullName, Email: testCase.mail}
-			assert.EqualValues(t, testCase.result, testUser.EmailTo())
+			assert.Equal(t, testCase.result, testUser.EmailTo())
 		})
 	}
 }
@@ -616,4 +626,38 @@ func TestGetInactiveUsers(t *testing.T) {
 	users, err = user_model.GetInactiveUsers(db.DefaultContext, time.Duration(interval*int64(time.Second)))
 	assert.NoError(t, err)
 	assert.Empty(t, users)
+}
+
+func TestCanCreateRepo(t *testing.T) {
+	defer test.MockVariableValue(&setting.Repository.MaxCreationLimit)()
+	const noLimit = -1
+	doerNormal := &user_model.User{}
+	doerAdmin := &user_model.User{IsAdmin: true}
+	t.Run("NoGlobalLimit", func(t *testing.T) {
+		setting.Repository.MaxCreationLimit = noLimit
+
+		assert.True(t, doerNormal.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: noLimit}))
+		assert.False(t, doerNormal.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: 0}))
+		assert.True(t, doerNormal.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: 100}))
+
+		assert.True(t, doerAdmin.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: noLimit}))
+		assert.True(t, doerAdmin.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: 0}))
+		assert.True(t, doerAdmin.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: 100}))
+	})
+
+	t.Run("GlobalLimit50", func(t *testing.T) {
+		setting.Repository.MaxCreationLimit = 50
+
+		assert.True(t, doerNormal.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: noLimit}))
+		assert.False(t, doerNormal.CanCreateRepoIn(&user_model.User{NumRepos: 60, MaxRepoCreation: noLimit})) // limited by global limit
+		assert.False(t, doerNormal.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: 0}))
+		assert.True(t, doerNormal.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: 100}))
+		assert.True(t, doerNormal.CanCreateRepoIn(&user_model.User{NumRepos: 60, MaxRepoCreation: 100}))
+
+		assert.True(t, doerAdmin.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: noLimit}))
+		assert.True(t, doerAdmin.CanCreateRepoIn(&user_model.User{NumRepos: 60, MaxRepoCreation: noLimit}))
+		assert.True(t, doerAdmin.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: 0}))
+		assert.True(t, doerAdmin.CanCreateRepoIn(&user_model.User{NumRepos: 10, MaxRepoCreation: 100}))
+		assert.True(t, doerAdmin.CanCreateRepoIn(&user_model.User{NumRepos: 60, MaxRepoCreation: 100}))
+	})
 }
