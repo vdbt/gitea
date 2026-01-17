@@ -136,7 +136,7 @@ func ListPublicKeys(ctx *context.APIContext) {
 	// parameters:
 	// - name: username
 	//   in: path
-	//   description: username of user
+	//   description: username of the user whose public keys are to be listed
 	//   type: string
 	//   required: true
 	// - name: fingerprint
@@ -211,7 +211,7 @@ func CreateUserPublicKey(ctx *context.APIContext, form api.CreateKeyOption, uid 
 		return
 	}
 
-	key, err := asymkey_model.AddPublicKey(ctx, uid, form.Title, content, 0)
+	key, err := asymkey_model.AddPublicKey(ctx, uid, form.Title, content, 0, false)
 	if err != nil {
 		repo.HandleAddKeyError(ctx, err)
 		return
